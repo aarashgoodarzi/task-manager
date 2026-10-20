@@ -1,0 +1,25 @@
+# Version control and editor metadata
+.git
+.gitignore
+.github
+.freebuff
+.DS_Store
+**/.DS_Store
+
+# Local secrets and environment files
+.env
+.env.*
+
+# Build artifacts and coverage output
+task-manager
+bin/
+*.out
+*.test
+coverage.out
+
+# Documentation and local orchestration do not affect the binaries
+decisions
+README.md
+*.md
+compose.yaml
+docker-compose*.yml

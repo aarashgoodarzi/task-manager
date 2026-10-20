@@ -16,6 +16,8 @@ file and the older record is marked `Superseded by NNNN`.
 | [0004](0004-startup-errors-and-health-endpoint.md) | Startup errors returned to the process edge; shallow health endpoint | Accepted (database requirement amended by 0005) | `internal/app/`, `cmd/task-manager/`, `internal/infra/server/` |
 | [0005](0005-task-crud-api.md) | Task CRUD on a service-owned repository port | Accepted | `internal/task/**`, `internal/infra/handler/`, `internal/infra/server/`, `internal/app/` |
 | [0006](0006-postgres-task-persistence.md) | Task persistence in PostgreSQL: table, versioned migrations, explicit-SQL repository | Accepted | `internal/infra/database/`, `internal/task/repository/postgres/`, `cmd/migrate/` |
+| [0007](0007-ci-with-postgresql-service.md) | CI runs the suite against a real PostgreSQL service and refuses silent skips | Accepted (coverage gate and image checks added by 0008) | `.github/workflows/ci.yml`, `Makefile`, README testing docs |
+| [0008](0008-containers-and-coverage-gate.md) | Containerized local environment and a 70% coverage gate on the combined suite | Accepted | `Dockerfile`, `.dockerignore`, `compose.yaml`, `Makefile`, CI, README |
 
 ## When to write one
 

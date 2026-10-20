@@ -230,3 +230,11 @@ ADR 0005 adds the task API and the composition this record left out:
   closed and the error names `make migrate`.
 - `cmd/migrate` is still the only process that changes the schema; the service
   never auto-migrates.
+
+## Amendment: continuous integration
+
+The environment-gated integration suite described above now runs in CI against
+a real PostgreSQL service, with an explicit assertion that the database-backed
+tests executed rather than skipped. The workflow, its isolation model, and its
+trade-offs are recorded in
+[ADR 0007](0007-ci-with-postgresql-service.md).

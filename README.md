@@ -10,6 +10,9 @@ The service fails closed: without `DATABASE_URL`, without a reachable
 PostgreSQL server, or without the expected schema it refuses to start. There is
 no in-memory fallback and no hidden storage.
 
+A multi-stage image and a [Compose environment](#docker-and-docker-compose) run
+the same stack locally with one command (`docker compose up -d --build`).
+
 ## Overview
 
 ### Current capabilities
@@ -29,8 +32,10 @@ no in-memory fallback and no hidden storage.
 | CRUD endpoints: `POST/GET/PUT/DELETE /tasks` | Implemented |
 | Consistent JSON error envelope, `404` / `405` handling | Implemented |
 | Unit, service, HTTP, and PostgreSQL integration tests | Implemented |
+| GitHub Actions CI with a PostgreSQL service, coverage gate, and image build | Implemented |
+| Multi-stage Docker image and Docker Compose local environment | Implemented |
 | Filtering, pagination, sorting controls, authentication | Not implemented |
-| Dockerfile / Docker Compose, CI pipeline, OpenAPI, metrics, tracing | Not implemented |
+| OpenAPI, metrics, tracing | Not implemented |
 
 Every request reads and writes the `tasks` table; task data survives restarts.
 
@@ -43,11 +48,12 @@ Every request reads and writes the `tasks` table; task data survives restarts.
 | Database access | `database/sql` with the [pgx](https://github.com/jackc/pgx) v5 stdlib driver |
 | Database | PostgreSQL (required) |
 | Migrations | Embedded `NNNN_description.sql` files applied by `cmd/migrate` |
+| Containers | Multi-stage `Dockerfile` (Alpine runtime, non-root) and `compose.yaml` |
 | Logging | `log/slog` (text handler, JSON not used) |
 | Configuration | Standard library `os.Getenv` with per-setting defaults |
 
-No ORM, external migration tool, or container setup is present. The Makefile is
-a thin wrapper over the Go toolchain.
+No ORM or external migration tool is present; migrations are embedded SQL
+applied by `cmd/migrate`. The Makefile is a thin wrapper over the Go toolchain.
 
 ## Architecture
 
@@ -59,7 +65,10 @@ layout and the composition root are covered by
 feature and its HTTP contract by
 [ADR 0005](decisions/0005-task-crud-api.md); PostgreSQL persistence and
 migrations by
-[ADR 0006](decisions/0006-postgres-task-persistence.md).
+[ADR 0006](decisions/0006-postgres-task-persistence.md). CI, containers, and the
+coverage gate are covered by
+[ADR 0007](decisions/0007-ci-with-postgresql-service.md) and
+[ADR 0008](decisions/0008-containers-and-coverage-gate.md).
 
 ### Architectural style and rationale
 
@@ -82,6 +91,11 @@ direction, not the folder names, is what makes the architecture.
 ```
 cmd/task-manager/                  process entry point: construct App, Initialize, Start
 cmd/migrate/                       apply embedded migrations and exit
+.github/workflows/ci.yml            CI: database-free suite, migrations, PostgreSQL
+                                   integration suite, race detector, coverage gate,
+                                   Docker build and Compose validation
+Dockerfile                         multi-stage image: static binaries, non-root runtime
+compose.yaml                       local PostgreSQL, one-shot migration, API service
 internal/app/                      composition root: config → logger → database (ping,
                                    schema check) → task repository/service/handler → server
 internal/infra/config/             environment loading and defaults
@@ -221,7 +235,7 @@ status 1. Startup is fail-closed:
 | `DATABASE_URL` empty | error `app: initialize database: DATABASE_URL is required` |
 | Malformed DSN | error `app: initialize database: database: invalid DSN: ...` |
 | Server unreachable / ping timeout | error `app: initialize database: ping: ...` |
-| `tasks` table missing | error `... schema is not initialized: table "tasks" is missing; run \`make migrate\`` |
+| `tasks` table missing | error `... schema is not initialized: table "tasks" is missing; run make migrate` |
 
 `GET /health` is the readiness probe: it pings the database with a 2-second
 budget and reports `503` when the ping fails. `GET /health/live` is the liveness
@@ -239,6 +253,9 @@ tell "process running" from "process ready". See
 - **`make`** (optional) for the wrapper targets in the
   [Makefile reference](#makefile-reference). Every target has a direct `go`
   equivalent.
+- **Docker with Compose v2 (optional).** Only needed for the image and the
+  local Compose environment described in
+  [Docker and Docker Compose](#docker-and-docker-compose).
 - **`curl`** (optional) for the examples below.
 
 Create the databases used below:
@@ -277,6 +294,29 @@ Behavior worth knowing:
   default. `DATABASE_URL` is validated.
 - **`DATABASE_URL` is mandatory.** A missing or malformed value aborts startup
   before the HTTP server binds.
+
+### Docker Compose variables
+
+`compose.yaml` reads these optional variables. They configure the local
+containers, not a process started directly with `go run`:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `POSTGRES_USER` | `task_manager` | Role created in the Compose PostgreSQL container and used in `DATABASE_URL`. |
+| `POSTGRES_PASSWORD` | `task_manager` | Password for that role. Local-development placeholder only; never reuse it elsewhere. |
+| `POSTGRES_DB` | `task_manager` | Database created and migrated in the container. |
+| `APP_PORT` | `8080` | Host port published for the API. The container itself always listens on `8080`. |
+| `LOG_LEVEL` | `info` | Passed through to the API container. |
+
+Inside Compose, `DATABASE_URL` is built from those values and points at the
+service name `postgres` on port `5432`. The API's own `PORT` stays `8080`; only
+the published host port changes with `APP_PORT`. PostgreSQL is not published on
+the host; inspect it through the container instead:
+
+```bash
+docker compose exec postgres psql -U task_manager -d task_manager
+# substitute your POSTGRES_USER / POSTGRES_DB values if you overrode them
+```
 
 ### Using `.env.example`
 
@@ -399,10 +439,105 @@ There is no `make stop` target; the service runs in the foreground.
   returned. `/health` reports `503` until the database is reachable again, and
   `/health/live` keeps reporting `200` because the process itself is alive.
 
-### Docker
+## Docker and Docker Compose
 
-There is no `Dockerfile`, `docker-compose.yml`, or container-based workflow in
-this repository. Run the service with the Go toolchain as shown above.
+The repository ships a multi-stage [Dockerfile](Dockerfile) — build stage on
+`golang:1.26.2-alpine`, runtime on `alpine:3.22` — and a
+[compose.yaml](compose.yaml) that runs PostgreSQL, applies migrations once, and
+starts the API.
+
+### Build and run the image
+
+```bash
+docker build -t task-manager:local .
+
+docker run --rm -d --name task-manager \
+  -p 8080:8080 \
+  -e DATABASE_URL='postgres://task_manager:task_manager@host.docker.internal:5432/task_manager?sslmode=disable' \
+  task-manager:local
+```
+
+The container needs a reachable, already-migrated PostgreSQL. To apply the
+migrations from the same image against that database:
+
+```bash
+docker run --rm \
+  -e DATABASE_URL='postgres://task_manager:task_manager@host.docker.internal:5432/task_manager?sslmode=disable' \
+  --entrypoint /app/migrate task-manager:local
+```
+
+On Linux, `host.docker.internal` is not defined by default; add
+`--add-host=host.docker.internal:host-gateway` to each `docker run` command, or
+use the Compose environment below, which addresses PostgreSQL by service name.
+
+The image contains exactly two static binaries (`/app/task-manager`,
+`/app/migrate`), no Go toolchain, source, tests, or `.git`; a minimal busybox
+shell is present only to back the health check. It runs as
+uid `10001`, exposes `8080`, declares `HEALTHCHECK` against `/health`, and uses
+an exec-form `ENTRYPOINT` so `SIGTERM` reaches the service for graceful
+shutdown.
+
+### Start the local environment
+
+```bash
+docker compose up -d --build
+docker compose ps
+curl -s http://localhost:8080/health
+curl -s http://localhost:8080/tasks
+```
+
+Compose starts PostgreSQL, waits for its health check, runs the one-shot
+`migrate` service, and only then starts `app`. If the migration fails, the API
+is not started. To publish on a different host port:
+
+```bash
+APP_PORT=9090 docker compose up -d
+```
+
+### Migrations
+
+- Migrations are applied by the `migrate` service, never by application
+  startup.
+- Re-run them any time; already-applied versions are recorded and skipped:
+
+  ```bash
+  docker compose run --rm migrate
+  docker compose logs migrate
+  ```
+
+### Logs and shutdown
+
+```bash
+docker compose logs -f app     # follow API logs
+docker compose stop app        # send SIGTERM; containers and volume stay
+docker compose down            # stop and remove containers; volume and data stay
+```
+
+`docker compose down -v` is the **explicit destructive** command: it removes
+the named volume and every stored task. `docker compose down` alone keeps the
+data.
+
+### Data persistence
+
+PostgreSQL data lives in the named volume `task-manager_pgdata` (mounted at
+`/var/lib/postgresql/data`). It survives container restarts, `docker compose
+down`, image rebuilds, and host reboots. Only `down -v` or an explicit
+`docker volume rm task-manager_pgdata` discards it.
+
+Credentials in `compose.yaml` are local-development placeholders. Override
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` through an untracked
+`.env` file or shell variables; nothing secret is baked into the image.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `app` exits with `initialize: app: initialize database: ping: ... connection refused` | `DATABASE_URL` points at the wrong host/port, or PostgreSQL is not ready | Check `docker compose logs postgres`; inside Compose the host is the service name `postgres`, not `localhost` |
+| `schema is not initialized: table "tasks" is missing` | Migrations never ran, or ran against another database | `docker compose run --rm migrate` |
+| Container reports `unhealthy` while `docker compose ps` shows it running | `/health` returns `503` because the database is unreachable | `docker compose logs postgres`; the health check is a readiness check, not liveness |
+| API not reachable on `localhost:8080` | Another process uses port 8080, or `APP_PORT` was changed | `lsof -i :8080`; start with `APP_PORT=9090 docker compose up -d` |
+| Tasks are gone after `docker compose down` | The volume was removed with `-v` | Expected; `down` without `-v` preserves data |
+| `docker compose` cannot find the file | Compose v2 expects `compose.yaml` in the working directory | Run the commands from the repository root |
 
 ## Testing and Quality Checks
 
@@ -413,7 +548,9 @@ The suite has two tiers:
 - **PostgreSQL integration tests** cover the repository and the migrations. They
   run only when `TEST_DATABASE_URL` is set and otherwise `t.Skip` with an
   explicit message. They truncate the `tasks` table, so they refuse to run
-  against a database whose name does not contain `test`.
+  against a database whose name does not contain `test`. CI always provides the
+  variable and asserts that these tests executed; see
+  [Continuous Integration](#continuous-integration).
 
 The configuration tests read the process environment directly, so run them with
 no overriding `PORT`, `DATABASE_URL`, `DATABASE_MAX_OPEN_CONNS`, `SERVER_*`, or
@@ -430,6 +567,7 @@ fail. Use `env -u PORT` for a clean run if needed.
 | Coverage summary | `TEST_DATABASE_URL=... go test -cover ./...` |
 | Coverage profile | `TEST_DATABASE_URL=... go test -coverprofile=coverage.out ./...` |
 | Browse coverage report | `go tool cover -html=coverage.out` |
+| Coverage gate (≥70% total, requires PostgreSQL) | `make coverage-check TEST_DATABASE_URL=...` |
 | Vet | `make vet` or `go vet ./...` |
 | Formatting check | `make fmt` or `gofmt -l .` |
 | Apply formatting | `gofmt -w .` |
@@ -441,18 +579,85 @@ Notes:
 
 - `make fmt` and `gofmt -l .` only **list** files whose formatting differs.
   They neither rewrite files nor fail the command. Use `gofmt -w .` to fix
-  them, and check for non-empty output in scripts or CI.
+  them; CI runs its own check and fails on any listed file.
 - `coverage.out` matches the `*.out` pattern in `.gitignore`.
 - Measured statement coverage on this tree: **77.4%** with the PostgreSQL
   integration tests and **58.4%** without them. The difference is the
   PostgreSQL adapter, whose statements only execute against a real database.
+- **The 70% gate covers the combined unit + integration suite.** `make
+  coverage-check` refuses to run without `TEST_DATABASE_URL`, so the gate can
+  never pass on a run that skipped the database tier; `COVERAGE_MIN` overrides
+  the threshold. CI runs the same target, which is why the database-free suite
+  alone is not the measurement.
+- Service tests inject a hand-written fake through the repository port; no
+  mocking library is used. The PostgreSQL adapter is verified by integration
+  tests against a real server, not by SQL mocks.
 - `internal/app` tests cover a missing `DATABASE_URL`, a malformed DSN, an
   unreachable server, a missing schema, and a successful PostgreSQL wiring when
   `TEST_DATABASE_URL` is available.
 - `cmd/task-manager`, `cmd/migrate`, and `internal/infra/handler` have no test
   files of their own (the envelope is exercised through the task handler and
   server tests; `cmd/migrate` is exercised by the migration integration test
-  and by running the command).
+  and by running the command in CI).
+- Database-backed commands pass `-p 1`, because packages share one PostgreSQL
+  database. `make test-integration` carries the flag, so a local run matches CI.
+
+## Continuous Integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to
+`main`, on every pull request, and on manual dispatch. It is the gate that
+actually proves persistence works: a local `go test ./...` may skip the database
+tier, CI may not.
+
+The job provisions a **real PostgreSQL service** (`postgres:16.4-alpine`, a
+pinned minor version) with an ephemeral `task_manager_test` database and a
+`pg_isready` health check, then runs, in order:
+
+1. A formatting check that fails on any file `gofmt` would change.
+2. `go vet ./...` and `go build ./...`.
+3. Database-free tests: `go test ./...` with `TEST_DATABASE_URL` cleared, so the
+   integration tests skip exactly as they would on a laptop without PostgreSQL.
+4. `go run ./cmd/migrate` with `DATABASE_URL`, exercising the documented
+   migration path.
+5. `make test-integration` with `TEST_DATABASE_URL` set.
+6. An assertion step that requires `--- PASS` for representative repository and
+   migration tests and fails on any `--- SKIP`, so a skipped run cannot look
+   green.
+7. `go test -race -p 1 ./...` against the same database.
+8. The coverage gate (`make coverage-check`): the combined suite must stay at or
+   above 70%, otherwise the job fails.
+9. `docker build` of the multi-stage image, an assertion that it runs as uid
+   `10001`, and `docker compose config --quiet` to validate the Compose file.
+
+Environment rules that matter:
+
+- `TEST_DATABASE_URL` is defined at job level; `DATABASE_URL` is set only for
+  the migration step. The configuration tests assert unset defaults, so a global
+  `DATABASE_URL` would break them for the wrong reason.
+- The credentials in the workflow belong to the ephemeral service container and
+  are not secrets. No repository secret or production DSN is used.
+- Database-backed commands pass `-p 1` and no test uses `t.Parallel`. Every CI
+  job starts an empty cluster, and tests truncate `tasks` between cases, so
+  state cannot leak between runs or between packages.
+- The suite refuses to truncate a database whose name does not contain `test`,
+  which guards local runs as well.
+
+To reproduce the CI database locally with Docker:
+
+```bash
+docker run --rm -d --name tm-ci-pg \
+  -e POSTGRES_USER=task_manager -e POSTGRES_PASSWORD=task_manager \
+  -e POSTGRES_DB=task_manager_test -p 5432:5432 postgres:16.4-alpine
+
+export TEST_DATABASE_URL='postgres://task_manager:task_manager@localhost:5432/task_manager_test?sslmode=disable'
+make test-integration
+
+docker stop tm-ci-pg
+```
+
+The workflow requests read-only repository access and performs no deployment,
+publishing, or push. The rationale and trade-offs are recorded in
+[ADR 0007](decisions/0007-ci-with-postgresql-service.md).
 
 ## Makefile Reference
 
@@ -465,13 +670,16 @@ The Makefile is a thin wrapper over the Go toolchain. It declares
 | `run` | Run the service in the foreground via `go run`. | `make run` | `DATABASE_URL`, migrated schema |
 | `migrate` | Apply pending embedded migrations. | `make migrate` | `DATABASE_URL` |
 | `test` | Run `go test ./...`; PostgreSQL tests skip without `TEST_DATABASE_URL`. | `make test` | Go toolchain |
-| `test-integration` | Run the whole suite with integration tests enabled; fails when `TEST_DATABASE_URL` is unset. | `make test-integration TEST_DATABASE_URL=...` | PostgreSQL |
+| `test-integration` | Run the whole suite with integration tests enabled and packages sequential (`-p 1`); fails when `TEST_DATABASE_URL` is unset. | `make test-integration TEST_DATABASE_URL=...` | PostgreSQL |
+| `coverage` | Write `coverage.out` for the combined suite and print the total. | `make coverage TEST_DATABASE_URL=...` | PostgreSQL (for a meaningful total) |
+| `coverage-check` | Enforce `COVERAGE_MIN` (default `70`) on the combined suite; fails below it or without `TEST_DATABASE_URL`. | `make coverage-check TEST_DATABASE_URL=...` | PostgreSQL |
 | `vet` | Run `go vet ./...`. | `make vet` | Go toolchain |
 | `fmt` | List files that `gofmt` would change; does not modify them. | `make fmt` | Go toolchain |
 
-Every target is listed in `.PHONY`. There are no `clean`, `cover`, `lint`, or
-`docker` targets; use the direct Go commands from
-[Testing and Quality Checks](#testing-and-quality-checks) for those workflows.
+Every target is listed in `.PHONY`. There are no `clean`, `lint`, or `docker`
+targets; use the direct Go and Docker commands from
+[Testing and Quality Checks](#testing-and-quality-checks) and
+[Docker and Docker Compose](#docker-and-docker-compose) for those workflows.
 
 ## API
 
@@ -727,3 +935,5 @@ considered, and the resulting trade-offs.
 | [0004](decisions/0004-startup-errors-and-health-endpoint.md) | Return startup errors to the process edge and expose a shallow, database-backed health endpoint. |
 | [0005](decisions/0005-task-crud-api.md) | Task model, service-owned repository port, HTTP and error contract. |
 | [0006](decisions/0006-postgres-task-persistence.md) | PostgreSQL task persistence: table, versioned embedded migrations, explicit-SQL repository, integration testing. |
+| [0007](decisions/0007-ci-with-postgresql-service.md) | Run the suite in CI against a real PostgreSQL service, isolate each run, and fail on silent integration-test skips. |
+| [0008](decisions/0008-containers-and-coverage-gate.md) | Multi-stage image, Compose environment with an explicit migration step, and a 70% coverage gate on the combined suite. |

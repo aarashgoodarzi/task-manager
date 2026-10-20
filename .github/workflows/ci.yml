@@ -1,0 +1,127 @@
+name: CI
+
+# The integration suite is gated by TEST_DATABASE_URL, so it only proves
+# anything when a real PostgreSQL server is present. This workflow provides one
+# and then asserts that the database-backed tests actually executed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test and verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        # Pinned minor version; the service is ephemeral, so every run starts
+        # from an empty cluster and cannot leak state into the next run.
+        image: postgres:16.4-alpine
+        env:
+          POSTGRES_USER: task_manager
+          POSTGRES_PASSWORD: task_manager
+          POSTGRES_DB: task_manager_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U task_manager -d task_manager_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # Test-only credentials for the ephemeral service container above. They
+      # grant access to nothing outside this job and are not secrets.
+      #
+      # DATABASE_URL is deliberately absent: the configuration tests assert the
+      # unset defaults, and only the migration step exports it.
+      TEST_DATABASE_URL: postgres://task_manager:task_manager@localhost:5432/task_manager_test?sslmode=disable
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "gofmt would change these files:" >&2
+            echo "$files" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # The database-free tier: TEST_DATABASE_URL is cleared so the integration
+      # tests skip exactly as they do on a machine without PostgreSQL.
+      - name: Unit tests (database-free)
+        env:
+          TEST_DATABASE_URL: ""
+        run: go test -count=1 ./...
+
+      - name: Apply migrations
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: go run ./cmd/migrate
+
+      # make test-integration refuses to run without TEST_DATABASE_URL, so a
+      # missing variable fails here instead of producing a green, empty run.
+      - name: PostgreSQL integration tests
+        run: make test-integration
+
+      # A skip would still exit 0, so prove that the database-backed tests ran
+      # and passed rather than trusting the suite's exit status alone.
+      - name: Assert PostgreSQL tests ran
+        run: |
+          out=$(go test -count=1 -v -run 'TestCreatePersistsTask|TestMigrateIsIdempotent' ./internal/task/repository/postgres ./internal/infra/database)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q -- '--- PASS: TestCreatePersistsTask'
+          printf '%s\n' "$out" | grep -q -- '--- PASS: TestMigrateIsIdempotent'
+          if printf '%s\n' "$out" | grep -q -- '--- SKIP'; then
+            echo "PostgreSQL integration tests were skipped despite TEST_DATABASE_URL being set" >&2
+            exit 1
+          fi
+
+      # Packages share one database, so they run sequentially (-p 1) to keep
+      # schema and table state from interleaving across packages.
+      - name: Race detector against PostgreSQL
+        run: go test -race -count=1 -p 1 ./...
+
+      # The gate measures the combined unit + integration suite, because the
+      # PostgreSQL adapter is only executed when TEST_DATABASE_URL is set. The
+      # threshold itself lives in the Makefile, not in this workflow.
+      - name: Coverage gate
+        run: make coverage-check
+
+      - name: Build Docker image
+        run: docker build --tag task-manager:ci .
+
+      # The runtime stage must not fall back to root if the USER line regresses.
+      - name: Verify the image runs as a non-root user
+        run: test "$(docker run --rm --entrypoint id task-manager:ci -u)" = "10001"
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet

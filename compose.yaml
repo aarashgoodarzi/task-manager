@@ -1,0 +1,64 @@
+# Local development environment: PostgreSQL, an explicit migration step, and the
+# API. Credentials are local-development placeholders only; override them with
+# an untracked .env file or shell variables if needed.
+#
+#   docker compose up -d --build   # start PostgreSQL, migrate, run the API
+#   docker compose logs -f app
+#   docker compose down            # stop, keep the database volume
+#   docker compose down -v         # stop and DELETE the database volume
+
+name: task-manager
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-task_manager}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-task_manager}
+      POSTGRES_DB: ${POSTGRES_DB:-task_manager}
+    volumes:
+      # Named volume: data survives container recreation and `docker compose down`.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # Applies the embedded migrations once and exits. The service itself never
+  # migrates at startup, so schema changes stay an explicit step.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: task-manager:local
+    entrypoint: ["/app/migrate"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-task_manager}:${POSTGRES_PASSWORD:-task_manager}@postgres:5432/${POSTGRES_DB:-task_manager}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: task-manager:local
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-task_manager}:${POSTGRES_PASSWORD:-task_manager}@postgres:5432/${POSTGRES_DB:-task_manager}?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    driver: local
