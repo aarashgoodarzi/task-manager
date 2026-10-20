@@ -17,6 +17,7 @@ import (
 	"github.com/aarashgoodarzi/task-manager/internal/infra/config"
 	"github.com/aarashgoodarzi/task-manager/internal/infra/database"
 	"github.com/aarashgoodarzi/task-manager/internal/infra/server"
+	"github.com/aarashgoodarzi/task-manager/internal/infra/swagger"
 	"github.com/aarashgoodarzi/task-manager/internal/task/handler"
 	"github.com/aarashgoodarzi/task-manager/internal/task/repository/postgres"
 	"github.com/aarashgoodarzi/task-manager/internal/task/service"
@@ -87,6 +88,7 @@ func (a *App) Initialize() error {
 	taskRepo := postgres.New(a.db)
 	taskService := service.New(taskRepo)
 	taskHandler := handler.New(taskService, a.log)
+	swaggerHandler := swagger.New()
 
 	a.server = server.New(server.Config{
 		Addr:              a.cfg.Server.Addr,
@@ -94,7 +96,7 @@ func (a *App) Initialize() error {
 		ReadTimeout:       a.cfg.Server.ReadTimeout,
 		WriteTimeout:      a.cfg.Server.WriteTimeout,
 		IdleTimeout:       a.cfg.Server.IdleTimeout,
-	}, a.log, a.health, taskHandler)
+	}, a.log, a.health, taskHandler, swaggerHandler)
 
 	a.log.Info("task-manager initialized", slog.String("addr", a.cfg.Server.Addr))
 	return nil

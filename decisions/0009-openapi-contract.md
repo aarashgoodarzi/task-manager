@@ -2,7 +2,8 @@
 
 * Status: Accepted
 * Date: 2026-10-20
-* Scope: `api/`
+* Scope: `api/`, `internal/infra/swagger/`, `internal/infra/server/`,
+  `internal/app/`, `go.mod`
 * Related: [0005](0005-task-crud-api.md) — the task HTTP contract this document
   formalizes; [0001](0001-clean-architecture.md) — cross-cutting concerns stay
   in adapters or bootstrap code.
@@ -52,8 +53,29 @@ names.
 `api/openapi.go` embeds `openapi.yaml` with `go:embed`. The document therefore
 travels with the binary and cannot be missing at runtime because of a working
 directory or packaging mistake. It adds no runtime dependency and no file I/O.
-Serving the document over HTTP is a separate change; this decision only
-establishes the artifact and makes it available to the binary.
+
+### Serving
+
+`internal/infra/swagger` is the documentation adapter. It is registered by
+`internal/app` as a `server.RouteRegistrar`, like a feature handler, and mounts:
+
+| Path | Content |
+| --- | --- |
+| `/swagger/openapi.yaml` | The embedded OpenAPI document, as `application/yaml` |
+| `/swagger/` | The Swagger UI index |
+| `/swagger/index.html` | The same index, without a redirect |
+| `/swagger/<asset>` | Swagger UI CSS, JavaScript, and favicon assets |
+
+The UI comes from `github.com/swaggest/swgui/v5emb`, which embeds Swagger UI
+and serves it through `statigz`. No CDN, external origin, or runtime file is
+involved; the documentation works offline and in a network-restricted
+deployment. The UI is configured with the embedded spec path, so it loads the
+same bytes this service exposes.
+
+The adapter registers only `GET`. Unsupported methods fall through to the
+router's existing `405` handler, matching the rest of the API. `/swagger` without
+a trailing slash is redirected to `/swagger/` by Gin's trailing-slash handling.
+Unknown assets return `404` from the embedded file server.
 
 ### Validation and maintenance
 
@@ -84,13 +106,17 @@ small handwritten API depend on a generator for little gain.
    network dependency and a third-party origin for an internal service, and it
    fails in offline or restricted environments. Embedding keeps the artifact
    local and reproducible.
-3. **Keep the contract in README prose and handler tests.** Rejected: prose is
+3. **Shipping a `swagger-ui/` directory beside the binary.** Rejected: the
+   documentation would break when the binary is copied without that directory,
+   and the container would need an extra asset layer. `go:embed` keeps the UI
+   and spec in the same artifact.
+4. **Keep the contract in README prose and handler tests.** Rejected: prose is
    not machine-readable, examples drift silently, and clients cannot generate
    code or mocks from it.
-4. **OpenAPI 3.1.** Rejected for now: 3.0.3 is the broadest-supported target
+5. **OpenAPI 3.1.** Rejected for now: 3.0.3 is the broadest-supported target
    for validators, UI tools, and generated clients, and this API uses no 3.1
    feature. Moving later is possible without changing the HTTP behavior.
-5. **Generate the specification from Go types.** Rejected: the handler's DTOs
+6. **Generate the specification from Go types.** Rejected: the handler's DTOs
    are intentionally small and do not carry descriptions, examples, or response
    documentation, so generation would still require annotations or a parallel
    metadata layer.
@@ -110,13 +136,18 @@ small handwritten API depend on a generator for little gain.
   the decision should be revisited.
 - **Cost:** the linter is a Node.js tool. It is confined to documentation
   validation and never enters the build or runtime path.
+- **Cost:** embedding Swagger UI assets increases the binary size. This is
+  preferable to a runtime asset directory or CDN for an internal service.
 
 ## Consequences
 
 - A contract change is not complete until `api/openapi.yaml` reflects it.
 - The document and the handler tests must agree; a disagreement is a bug in one
   of them, not a reason to weaken either.
-- The specification is available to Go code through `api.OpenAPI`; serving it,
-  and the interactive UI, are follow-up work rather than part of this record.
+- The specification and UI are available at `/swagger/openapi.yaml` and
+  `/swagger/` whenever the service is running, including in the container.
+- The docs adapter is composed in `internal/app` and uses only `GET`; adding a
+  second documentation surface would be a new adapter, not a reason to couple
+  feature handlers to Swagger UI.
 - The linter command and the contract's maintenance rule belong in the README
   so a contributor does not need to infer them from this record.

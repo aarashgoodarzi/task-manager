@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,11 +9,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/aarashgoodarzi/task-manager/api"
 	"github.com/aarashgoodarzi/task-manager/internal/infra/handler"
+	"github.com/aarashgoodarzi/task-manager/internal/infra/swagger"
 )
 
 func init() {
@@ -164,5 +168,25 @@ func TestModulesRegisterRoutes(t *testing.T) {
 
 	if rec := serve(s, http.MethodGet, "/stub"); rec.Code != http.StatusNoContent {
 		t.Fatalf("stub route status = %d, want 204", rec.Code)
+	}
+}
+
+func TestDocumentationRoutesAreServedFromModules(t *testing.T) {
+	s := newTestServer(t, nil, swagger.New())
+
+	spec := serve(s, http.MethodGet, swagger.SpecPath)
+	if spec.Code != http.StatusOK {
+		t.Fatalf("spec status = %d, want 200, body = %s", spec.Code, spec.Body.String())
+	}
+	if !bytes.Equal(spec.Body.Bytes(), api.OpenAPI) {
+		t.Fatal("served spec differs from the embedded contract")
+	}
+
+	ui := serve(s, http.MethodGet, swagger.UIPath)
+	if ui.Code != http.StatusOK {
+		t.Fatalf("UI status = %d, want 200, body = %s", ui.Code, ui.Body.String())
+	}
+	if !strings.Contains(ui.Body.String(), "Task Manager API") {
+		t.Fatal("UI did not render the API title")
 	}
 }
