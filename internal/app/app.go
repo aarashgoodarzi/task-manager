@@ -18,10 +18,7 @@ import (
 	"github.com/aarashgoodarzi/task-manager/internal/infra/database"
 	infraMetrics "github.com/aarashgoodarzi/task-manager/internal/infra/metrics"
 	"github.com/aarashgoodarzi/task-manager/internal/infra/server"
-	"github.com/aarashgoodarzi/task-manager/internal/infra/swagger"
-	"github.com/aarashgoodarzi/task-manager/internal/task/handler"
 	"github.com/aarashgoodarzi/task-manager/internal/task/repository/postgres"
-	"github.com/aarashgoodarzi/task-manager/internal/task/service"
 )
 
 // databaseStartupTimeout bounds the connectivity and schema checks performed
@@ -88,10 +85,9 @@ func (a *App) Initialize() error {
 	a.db = db
 	a.health = db
 
+	// The pool is wrapped once and shared by the task module and the metrics
+	// refresher; both consume it through the narrow ports they declare.
 	taskRepo := postgres.New(a.db)
-	taskService := service.New(taskRepo)
-	taskHandler := handler.New(taskService, a.log)
-	swaggerHandler := swagger.New()
 
 	// Instrumentation owns its own registry, so it can be constructed per App
 	// (including in tests) without touching the global Prometheus registry.
@@ -103,14 +99,15 @@ func (a *App) Initialize() error {
 		_ = db.Close()
 		return fmt.Errorf("app: initialize metrics: %w", err)
 	}
-
+	// HTTP modules contribute routes through buildHandlers, so Initialize does
+	// not grow an argument per module when a feature is added.
 	a.server = server.New(server.Config{
 		Addr:              a.cfg.Server.Addr,
 		ReadHeaderTimeout: a.cfg.Server.ReadHeaderTimeout,
 		ReadTimeout:       a.cfg.Server.ReadTimeout,
 		WriteTimeout:      a.cfg.Server.WriteTimeout,
 		IdleTimeout:       a.cfg.Server.IdleTimeout,
-	}, a.log, a.health, a.metrics, taskHandler, swaggerHandler)
+	}, a.log, a.health, a.metrics, a.buildHandlers(taskRepo)...)
 
 	a.log.Info("task-manager initialized", slog.String("addr", a.cfg.Server.Addr))
 	return nil

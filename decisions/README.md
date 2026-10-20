@@ -20,6 +20,7 @@ file and the older record is marked `Superseded by NNNN`.
 | [0008](0008-containers-and-coverage-gate.md) | Containerized local environment and a 70% coverage gate on the combined suite | Accepted | `Dockerfile`, `.dockerignore`, `compose.yaml`, `Makefile`, CI, README |
 | [0009](0009-openapi-contract.md) | A checked-in OpenAPI document as the HTTP contract | Accepted | `api/`, `internal/infra/swagger/`, `internal/infra/server/`, `internal/app/` |
 | [0010](0010-prometheus-metrics-and-request-correlation.md) | Prometheus metrics and request correlation for HTTP observability | Accepted | `internal/infra/metrics/`, `internal/infra/server/`, `internal/task/repository/postgres/`, `internal/infra/config/`, `internal/app/` |
+| [0011](0011-http-handler-composition.md) | One composition point for HTTP module handlers | Accepted | `internal/app/`, `internal/infra/server/`, `internal/task/handler/`, `internal/infra/swagger/` |
 
 ## When to write one
 

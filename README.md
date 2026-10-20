@@ -642,7 +642,7 @@ repository knows how to count persisted tasks.
 | --- | --- |
 | `cmd/task-manager` | Process entry point; constructs the app, calls `Initialize` and `Start`, and handles returned errors. |
 | `cmd/migrate` | Applies embedded migrations and exits non-zero on failure. |
-| `internal/app` | Composition root: loads config, builds the logger and pool, verifies the schema, wires the task stack, docs adapter, and server, and shuts down in reverse order. |
+| `internal/app` | Composition root: loads config, builds the logger and pool, verifies the schema, composes HTTP modules through `buildHandlers`, builds the server, and shuts down in reverse order. |
 | `internal/infra/config` | Reads environment variables into plain structs and applies defaults. No network or filesystem I/O. |
 | `internal/infra/database` | Validates the DSN, opens the pooled `*sql.DB`, embeds and applies migrations, and verifies required tables. |
 | `internal/infra/server` | Builds the Gin router, request-ID and completion middleware, health and metrics endpoints, feature modules, and `404`/`405` handlers; owns HTTP lifecycle. Declares the narrow `HealthChecker`, `RouteRegistrar`, and `Instrumentation` interfaces. |
@@ -667,18 +667,21 @@ then `Start`. The composition root performs the actual wiring:
 5. `Initialize` pings with a five-second budget and calls
    `database.VerifySchema`, which requires the `tasks` table. A failure closes
    the pool and stops startup.
-6. The task repository, service, and handler are constructed, followed by the
-   docs adapter.
+6. The task repository is constructed once and shared by the metrics refresher
+   and the task module.
 7. `metrics.New` builds a dedicated Prometheus registry, and a
    `TaskCountRefresher` is wired to the task repository with the configured
    refresh interval.
-8. `server.New` receives the pool as the health checker, the metrics adapter as
-   `Instrumentation`, and tasks plus docs as `RouteRegistrar` values. It builds
+8. `buildHandlers` (in `internal/app/wiring.go`) composes the HTTP modules —
+   the task handler over the repository port and the docs adapter — and returns
+   them as `server.RouteRegistrar` values.
+9. `server.New` receives the pool as the health checker, the metrics adapter as
+   `Instrumentation`, and the registrars returned by `buildHandlers`. It builds
    the router with `gin.Recovery()`, request-ID and completion middleware,
    health routes, `/metrics`, `/swagger/`, and feature routes.
-9. `Start` installs a signal context for `SIGINT`/`SIGTERM`, starts the
-   task-count refresher, runs the server, shuts it down with a ten-second
-   budget, stops and waits for the refresher, and closes the pool.
+10. `Start` installs a signal context for `SIGINT`/`SIGTERM`, starts the
+    task-count refresher, runs the server, shuts it down with a ten-second
+    budget, stops and waits for the refresher, and closes the pool.
 
 The server never imports the task packages or the database adapter. It knows
 only the narrow interfaces it declares itself:
@@ -712,7 +715,9 @@ internal/task/
 
 1. Declare interfaces where they are consumed, not in a shared interface package.
 2. Keep domain and application packages free of transport and driver imports.
-3. Wire concrete adapters only in `internal/app`.
+3. Wire concrete adapters only in `internal/app`. Register a new HTTP module
+   in `buildHandlers` (`internal/app/wiring.go`); do not add module-specific
+   arguments to `server.New`.
 4. Keep `main` trivial.
 5. Test at the interface boundary with hand-written fakes; keep SQL tests in the
    integration tier.
@@ -1091,6 +1096,7 @@ as the practical guide for setup, operation, and the current API.
 | [0008. Containerized local environment and a 70% coverage gate on the combined suite](decisions/0008-containers-and-coverage-gate.md) | Ship a multi-stage image, model migrations as a Compose service, and enforce 70% coverage on the combined suite. | Accepted |
 | [0009. A checked-in OpenAPI document as the HTTP contract](decisions/0009-openapi-contract.md) | Make [`api/openapi.yaml`](api/openapi.yaml) the canonical contract and serve it with embedded Swagger UI; no code generation. | Accepted |
 | [0010. Prometheus metrics and request correlation for HTTP observability](decisions/0010-prometheus-metrics-and-request-correlation.md) | Expose bounded request metrics, an eventually consistent PostgreSQL-backed task gauge, and `X-Request-ID` correlation from a dedicated registry; no OpenTelemetry. | Accepted |
+| [0011. One composition point for HTTP module handlers](decisions/0011-http-handler-composition.md) | Compose HTTP modules through `buildHandlers` returning `server.RouteRegistrar` values; keep lifecycle in the composition root and avoid a plugin framework. | Accepted |
 
 No record is superseded or deprecated. ADRs 0003, 0004, and 0007 carry amendment
 notes because later records refine part of their decision; read the amending ADR
