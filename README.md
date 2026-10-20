@@ -34,8 +34,9 @@ the same stack locally with one command (`docker compose up -d --build`).
 | Unit, service, HTTP, and PostgreSQL integration tests | Implemented |
 | GitHub Actions CI with a PostgreSQL service, coverage gate, and image build | Implemented |
 | Multi-stage Docker image and Docker Compose local environment | Implemented |
+| OpenAPI 3.0.3 contract and embedded Swagger UI | Implemented |
 | Filtering, pagination, sorting controls, authentication | Not implemented |
-| OpenAPI, metrics, tracing | Not implemented |
+| Metrics and tracing | Not implemented |
 
 Every request reads and writes the `tasks` table; task data survives restarts.
 
@@ -51,6 +52,7 @@ Every request reads and writes the `tasks` table; task data survives restarts.
 | Containers | Multi-stage `Dockerfile` (Alpine runtime, non-root) and `compose.yaml` |
 | Logging | `log/slog` (text handler, JSON not used) |
 | Configuration | Standard library `os.Getenv` with per-setting defaults |
+| API documentation | OpenAPI 3.0.3 at `/swagger/openapi.yaml`; embedded Swagger UI via `swaggest/swgui` |
 
 No ORM or external migration tool is present; migrations are embedded SQL
 applied by `cmd/migrate`. The Makefile is a thin wrapper over the Go toolchain.
@@ -68,7 +70,9 @@ migrations by
 [ADR 0006](decisions/0006-postgres-task-persistence.md). CI, containers, and the
 coverage gate are covered by
 [ADR 0007](decisions/0007-ci-with-postgresql-service.md) and
-[ADR 0008](decisions/0008-containers-and-coverage-gate.md).
+[ADR 0008](decisions/0008-containers-and-coverage-gate.md); the API contract
+and its documentation are covered by
+[ADR 0009](decisions/0009-openapi-contract.md).
 
 ### Architectural style and rationale
 
@@ -96,13 +100,16 @@ cmd/migrate/                       apply embedded migrations and exit
                                    Docker build and Compose validation
 Dockerfile                         multi-stage image: static binaries, non-root runtime
 compose.yaml                       local PostgreSQL, one-shot migration, API service
+api/                               embedded OpenAPI 3.0.3 contract (go:embed)
 internal/app/                      composition root: config → logger → database (ping,
-                                   schema check) → task repository/service/handler → server
+                                   schema check) → task repository/service/handler →
+                                   docs adapter → server
 internal/infra/config/             environment loading and defaults
 internal/infra/database/           PostgreSQL adapter: DSN validation, *sql.DB pool,
                                    embedded migrations, schema verification
 internal/infra/server/             Gin router, middleware, /health, 404/405, HTTP lifecycle
 internal/infra/handler/            shared HTTP delivery helpers and JSON error envelope
+internal/infra/swagger/            docs adapter: embedded spec and Swagger UI
 internal/task/domain/              Task aggregate, statuses, validation, UUID identifiers
 internal/task/service/             use cases; declares the repository port it consumes
 internal/task/handler/             Gin handlers: request/response mapping, error mapping
@@ -113,11 +120,13 @@ internal/task/repository/postgres/ PostgreSQL driven adapter: explicit SQL over 
 | --- | --- | --- |
 | `cmd/task-manager` | Process entry point. Contains no logic beyond error handling for startup. | `internal/app` |
 | `cmd/migrate` | Applies pending migrations using the configuration and exits non-zero on any error. | `config`, `database` |
-| `internal/app` | Composition root. Loads config, builds the logger, the required pool, verifies the schema, wires the task stack, and the server; shuts them down in reverse order. | `config`, `database`, `server`, task packages |
+| `internal/app` | Composition root. Loads config, builds the logger, the required pool, verifies the schema, wires the task stack, the docs adapter, and the server; shuts them down in reverse order. | `config`, `database`, `server`, `swagger`, task packages |
+| `api` | Embeds the canonical OpenAPI document and exposes it as `api.OpenAPI`. It contains no HTTP, business, or storage logic. | `embed` |
 | `internal/infra/config` | Reads environment variables into plain structs and applies defaults. Performs no network or filesystem I/O and knows nothing about HTTP or SQL. | Standard library only |
 | `internal/infra/database` | Validates the DSN with `pgx.ParseConfig`, opens a pooled `*sql.DB`, applies pool limits, embeds and applies migrations, verifies required tables. | `database/sql`, `pgx`, `embed` |
 | `internal/infra/server` | Builds the Gin engine, registers middleware, `/health`, `/health/live`, feature modules, and `404`/`405` handlers; runs the HTTP server and shuts it down gracefully. Declares the `HealthChecker` and `RouteRegistrar` ports it consumes. | Gin, `internal/infra/handler`, standard library |
 | `internal/infra/handler` | Shared HTTP delivery code. Defines the single JSON error envelope and writes it with an HTTP status. | Gin, `net/http` |
+| `internal/infra/swagger` | Serves the embedded OpenAPI document and Swagger UI under `/swagger`; registers only `GET` and contains no feature logic. | `api`, Gin, `swaggest/swgui/v5emb` |
 | `internal/task/domain` | `Task`, the closed `Status` set, defaults, validation, and the UUID identifier format and generator. No framework or driver imports. | Standard library |
 | `internal/task/service` | Create, list, get, update, delete use cases. Declares the `Repository` port and `ErrNotFound`. | `context`, `domain` |
 | `internal/task/handler` | Decodes requests strictly, validates path IDs, calls the use cases, and maps results and errors to HTTP. Declares the `TaskService` port it consumes. | Gin, `internal/infra/handler`, `domain`, `service` |
@@ -141,8 +150,10 @@ type RouteRegistrar interface {
 ```
 
 `*sql.DB` satisfies `HealthChecker`, so `internal/app` passes the pool directly.
-The task handler satisfies `RouteRegistrar`, so the server registers feature
-routes without importing the task package. Inside the feature,
+The task handler and the docs adapter satisfy `RouteRegistrar`, so the server
+registers both without importing either concrete adapter. The docs adapter is
+the only package that imports `api` and the Swagger UI library. Inside the
+feature,
 `service.Repository` is declared by the service and implemented by
 `repository/postgres`; `handler.TaskService` is declared by the handler and
 satisfied by `*service.Service`.
@@ -164,11 +175,12 @@ satisfied by `*service.Service`.
    missing table closes the pool and returns an error, so the process never
    starts half-wired.
 6. `postgres.New(pool)` → `service.New(...)` → `handler.New(...)` builds the task
-   stack on the PostgreSQL repository.
-7. `server.New(...)` receives the pool as the health checker and the task handler
-   as a `RouteRegistrar`, builds the Gin router with `gin.Recovery()`, a
-   structured request logger, `/health`, `/health/live`, and the task routes, and
-   wraps it in an `*http.Server` with the configured timeouts.
+   stack on the PostgreSQL repository, and `swagger.New()` builds the docs
+   adapter from the embedded contract and UI assets.
+7. `server.New(...)` receives the pool as the health checker and both adapters
+   as `RouteRegistrar`s, builds the Gin router with `gin.Recovery()`, a
+   structured request logger, `/health`, `/health/live`, the task routes, and
+   `/swagger/`, and wraps it in an `*http.Server` with the configured timeouts.
 8. `Start()` installs a signal context for `SIGINT`/`SIGTERM`, blocks on
    `server.Run`, then shuts the HTTP server down with a 10-second budget and
    closes the connection pool.
@@ -484,6 +496,7 @@ docker compose up -d --build
 docker compose ps
 curl -s http://localhost:8080/health
 curl -s http://localhost:8080/tasks
+# interactive docs: http://localhost:8080/swagger/
 ```
 
 Compose starts PostgreSQL, waits for its health check, runs the one-shot
@@ -573,6 +586,7 @@ they are deterministic and do not depend on the shell environment. A preset
 | Build the binary | `make build` or `go build -o task-manager ./cmd/task-manager` |
 | Compile every package | `go build ./...` |
 | Apply migrations | `make migrate` or `go run ./cmd/migrate` |
+| Validate the OpenAPI document | `npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml` |
 
 Notes:
 
@@ -580,8 +594,8 @@ Notes:
   They neither rewrite files nor fail the command. Use `gofmt -w .` to fix
   them; CI runs its own check and fails on any listed file.
 - `coverage.out` matches the `*.out` pattern in `.gitignore`.
-- Measured statement coverage on this tree: **77.4%** with the PostgreSQL
-  integration tests and **58.4%** without them. The difference is the
+- Measured statement coverage on this tree: **77.8%** with the PostgreSQL
+  integration tests and **59.0%** without them. The difference is the
   PostgreSQL adapter, whose statements only execute against a real database.
 - **The 70% gate covers the combined unit + integration suite.** `make
   coverage-check` refuses to run without `TEST_DATABASE_URL`, so the gate can
@@ -594,10 +608,19 @@ Notes:
 - `internal/app` tests cover a missing `DATABASE_URL`, a malformed DSN, an
   unreachable server, a missing schema, and a successful PostgreSQL wiring when
   `TEST_DATABASE_URL` is available.
-- `cmd/task-manager`, `cmd/migrate`, and `internal/infra/handler` have no test
-  files of their own (the envelope is exercised through the task handler and
-  server tests; `cmd/migrate` is exercised by the migration integration test
-  and by running the command in CI).
+- `internal/infra/swagger` tests cover the exact embedded spec bytes, the UI
+  index and its `/swagger/index.html` alias, embedded CSS and JavaScript assets,
+  the `GET`-only contract, unknown assets, and the `/swagger` trailing-slash
+  redirect. `internal/infra/server` verifies that the docs adapter is mounted as
+  a module and is not shadowed by the `404` handler.
+- The OpenAPI document is validated with Redocly, a development-only Node.js
+  tool. It is not a Go dependency and is not needed to build, test, or run the
+  service. There is no generation step: edit `api/openapi.yaml` directly.
+- `cmd/task-manager`, `cmd/migrate`, `api`, and `internal/infra/handler` have no
+  test files of their own (the envelope is exercised through the task handler
+  and server tests; the embedded spec is exercised through the Swagger adapter;
+  `cmd/migrate` is exercised by the migration integration test and by running
+  the command in CI).
 - Database-backed commands pass `-p 1`, because packages share one PostgreSQL
   database. `make test-integration` carries the flag, so a local run matches CI.
 
@@ -683,8 +706,40 @@ targets; use the direct Go and Docker commands from
 
 ## API
 
-The service exposes health endpoints and a REST resource for tasks. All request
-and response bodies are JSON (`Content-Type: application/json`).
+The task and health endpoints use JSON request and response bodies
+(`Content-Type: application/json`). The documentation endpoints serve YAML and
+HTML.
+
+### Documentation
+
+Interactive [Swagger UI](https://swagger.io/tools/swagger-ui/) is served from
+the application:
+
+- UI: <http://localhost:8080/swagger/> (also `/swagger/index.html`)
+- Raw contract: <http://localhost:8080/swagger/openapi.yaml>
+  (`application/yaml`)
+
+The UI and its assets are embedded in the binary through
+`github.com/swaggest/swgui/v5emb`; there is no CDN, external origin, or asset
+directory to ship. Both are read-only: only `GET` is registered, and other
+methods return `405`. Unknown assets return `404`, and `/swagger` redirects to
+`/swagger/`.
+
+`api/openapi.yaml` is the canonical contract for every task and health route,
+including status codes, schemas, defaults, examples, and the error envelope.
+Update it in the same change as any route, payload, status, or header change;
+the handler tests remain the behavioral checks. It is hand-written, not
+generated, so there is no document to regenerate.
+
+Validate it with Redocly (requires Node.js/npm; development only):
+
+```bash
+npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml
+```
+
+The command exits non-zero on a validation error. The current document has one
+advisory warning: OpenAPI's `info` object has no `license`, because this
+repository does not declare one.
 
 ### Task endpoints
 
@@ -916,6 +971,9 @@ Rules that keep the architecture intact:
    response shape.
 8. **Change the schema with a migration.** Never edit an applied migration file;
    add the next `NNNN_` file with one statement.
+9. **Update the API contract in the same change.** A route, payload, status
+   code, or header change edits `api/openapi.yaml`; the docs adapter serves the
+   embedded file automatically. Run the OpenAPI linter before review.
 
 When a new architectural choice is made — a migration strategy, a readiness or
 liveness split, a caching layer — record it in `/decisions` rather than only in
@@ -937,3 +995,4 @@ considered, and the resulting trade-offs.
 | [0006](decisions/0006-postgres-task-persistence.md) | PostgreSQL task persistence: table, versioned embedded migrations, explicit-SQL repository, integration testing. |
 | [0007](decisions/0007-ci-with-postgresql-service.md) | Run the suite in CI against a real PostgreSQL service, isolate each run, and fail on silent integration-test skips. |
 | [0008](decisions/0008-containers-and-coverage-gate.md) | Multi-stage image, Compose environment with an explicit migration step, and a 70% coverage gate on the combined suite. |
+| [0009](decisions/0009-openapi-contract.md) | A checked-in OpenAPI 3.0.3 contract, embedded in the binary and served with offline Swagger UI. |

@@ -126,8 +126,8 @@ small handwritten API depend on a generator for little gain.
 - **Gain:** the contract is explicit, reviewable, and usable by client
   generators and mock tools; examples document behavior that tests alone make
   tedious to discover.
-- **Gain:** the document is embedded, so serving it later requires no runtime
-  file access and no deployment artifact beyond the binary.
+- **Gain:** the document and UI are embedded, so serving them requires no
+  runtime file access and no deployment artifact beyond the binary.
 - **Cost:** the document is hand-written and can drift from the handlers. This
   is mitigated by updating it in the same change as the contract, by the
   linter, and by the existing handler tests.
