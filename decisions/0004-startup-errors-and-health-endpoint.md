@@ -1,6 +1,7 @@
 # 0004. Startup errors are returned to the process edge; `/health` reports database reachability
 
-* Status: Accepted
+* Status: Accepted; the database requirement and `/health` bodies are amended by
+  [0005](0005-task-crud-api.md)
 * Date: 2026-10-19
 * Scope: `internal/app/app.go`, `cmd/task-manager/main.go`,
   `internal/infra/server/`
@@ -104,3 +105,30 @@ would be inventing schema before it is designed.
   `/health` in the server adapter, not inside domain packages.
 - Startup failures never produce a partially initialized process: the HTTP
   server is constructed only after the pool exists.
+
+## Amendment: PostgreSQL-only runtime
+
+[ADR 0006](0006-postgres-task-persistence.md) adds PostgreSQL task persistence
+and [ADR 0005](0005-task-crud-api.md) wires the task API to it. Together they
+settle the runtime contract this record deferred:
+
+- `DATABASE_URL` is required. An empty value fails startup with
+  `app: initialize database: DATABASE_URL is required`.
+- `Initialize` does not rely on a lazy pool alone: it pings the server with a
+  5-second budget and calls `database.VerifySchema`. An unreachable server or a
+  missing `tasks` table closes the pool and fails startup, so the process is
+  never up but unable to serve a request.
+- `GET /health` is the readiness probe. A successful ping returns
+  `200 {"status":"ok","database":"ok"}`; a failed ping returns
+  `503 {"status":"error","error":"database unreachable"}`. A nil checker —
+  reachable only in tests that build the server directly — returns
+  `503 {"status":"error","error":"database not configured"}` instead of a
+  misleading `200`.
+- `GET /health/live` is the liveness probe: `200 {"status":"ok"}` without
+  touching the database. This is the liveness/readiness split this record
+  deferred until there was a dependency worth distinguishing.
+- `database: not_configured` as a `200` state is gone. A process without a
+  database is not a supported runtime state, so it is not reported as healthy.
+
+Startup errors returned to `main`, the bounded ping, and shutdown ordering are
+unchanged.

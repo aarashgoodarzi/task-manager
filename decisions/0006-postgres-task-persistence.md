@@ -183,8 +183,8 @@ integration tests that talk to a real PostgreSQL:
   explicit, ordered, and auditable; persistence is tested against the real
   engine rather than a mock.
 - **Cost:** two processes to think about in deployment — migrate, then start.
-  The repository is not wired yet, so an unmigrated database is not detected at
-  startup; the API change adds schema verification.
+  Startup verifies the schema (ADR 0005), so forgetting the migration is caught
+  before the HTTP server binds rather than on the first request.
 - **Cost:** integration tests need a PostgreSQL instance and a database whose
   name contains `test`; they are skipped on machines without one, so a broken SQL
   change can pass `go test ./...` locally.
@@ -204,16 +204,29 @@ integration tests that talk to a real PostgreSQL:
 
 - `internal/task/repository/postgres` is the only place that contains task SQL;
   handlers and the service never see `*sql.DB`.
-- `internal/task/domain.NewID` is the single identifier generator, shared by
-  adapters and covered by a domain test.
+- `internal/task/domain.NewID` is the single identifier generator, used by the
+  PostgreSQL adapter and covered by a domain test.
 - Changing the task schema means adding a migration file, never editing an
   applied one; the ledger is the record of what has run.
 - `make migrate` (added to the `Makefile`) is the supported way to create or
   update the schema; `cmd/migrate` requires `DATABASE_URL` and fails with a
   non-zero exit on any error.
-- The repository is not wired into the running process yet. Constructing it in
-  `internal/app` and deciding how startup reacts to a missing schema belong to
-  the API change; the port and adapter are already complete.
+- `internal/app` constructs the adapter and wires it into the task service
+  (ADR 0005); no other package owns task SQL, and there is no fallback store.
 - New aggregates follow the same shape: a migration per statement, a repository
   in the feature slice, explicit SQL, sentinel not-found mapping, and an
   environment-gated integration suite.
+
+## Amendment: runtime wiring
+
+ADR 0005 adds the task API and the composition this record left out:
+
+- `internal/app` constructs `postgres.New(pool)` and passes it to
+  `service.New`; the adapter is the only task repository. There is no in-memory
+  fallback.
+- Startup pings the pool with a 5-second budget and calls
+  `database.VerifySchema` before the HTTP server is built. The trade-off noted
+  above — an unmigrated database reaching query time — is closed: startup fails
+  closed and the error names `make migrate`.
+- `cmd/migrate` is still the only process that changes the schema; the service
+  never auto-migrates.

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/aarashgoodarzi/task-manager/internal/infra/handler"
 )
 
 // HealthChecker is the only capability the server needs from the database
@@ -20,6 +22,13 @@ import (
 // driver — *sql.DB already satisfies it.
 type HealthChecker interface {
 	PingContext(ctx context.Context) error
+}
+
+// RouteRegistrar is a feature's HTTP adapter: it registers its own routes on
+// the shared router. The server depends on this narrow port instead of on
+// concrete feature handlers, so routes are composed in internal/app.
+type RouteRegistrar interface {
+	RegisterRoutes(r gin.IRouter)
 }
 
 // Config drives the HTTP listener and timeouts.
@@ -33,15 +42,18 @@ type Config struct {
 
 // Server owns routing, middleware, and the HTTP server lifecycle.
 type Server struct {
-	log *slog.Logger
-	db  HealthChecker
-	srv *http.Server
+	log     *slog.Logger
+	db      HealthChecker
+	modules []RouteRegistrar
+	srv     *http.Server
 }
 
-// New builds the Gin router and wraps it in an *http.Server. db may be nil
-// if no readiness check is desired (e.g. in tests).
-func New(cfg Config, log *slog.Logger, db HealthChecker) *Server {
-	s := &Server{log: log, db: db}
+// New builds the Gin router and wraps it in an *http.Server. db is the
+// database checker /health pings; a nil value makes /health report 503, since a
+// process without persistence is not ready. Tests construct the server that way
+// but the composition root always supplies a pool.
+func New(cfg Config, log *slog.Logger, db HealthChecker, modules ...RouteRegistrar) *Server {
+	s := &Server{log: log, db: db, modules: modules}
 	s.srv = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.buildRouter(),
@@ -82,15 +94,39 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) buildRouter() *gin.Engine {
 	r := gin.New()
+	r.HandleMethodNotAllowed = true
 	r.Use(gin.Recovery())
 	r.Use(s.requestLogger())
 	r.GET("/health", s.handleHealth)
+	r.GET("/health/live", s.handleLive)
+
+	for _, module := range s.modules {
+		module.RegisterRoutes(r)
+	}
+
+	r.NoRoute(func(c *gin.Context) {
+		handler.Write(c, http.StatusNotFound, handler.CodeNotFound, "route not found", nil)
+	})
+	r.NoMethod(func(c *gin.Context) {
+		handler.Write(c, http.StatusMethodNotAllowed, handler.CodeMethodNotAllowed, "method not allowed", nil)
+	})
+
 	return r
 }
 
+// handleLive answers a process-liveness probe. It never touches the database,
+// so an orchestrator can tell a running process from a ready one.
+func (s *Server) handleLive(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// handleHealth answers a readiness probe: the process plus database
+// connectivity. It never reports a database check that did not run.
 func (s *Server) handleHealth(c *gin.Context) {
 	if s.db == nil {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		// No checker means no persistence is wired. That is not a healthy state,
+		// so say so instead of claiming an unchecked database is fine.
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "database not configured"})
 		return
 	}
 
@@ -101,7 +137,7 @@ func (s *Server) handleHealth(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "database unreachable"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "database": "ok"})
 }
 
 func (s *Server) requestLogger() gin.HandlerFunc {

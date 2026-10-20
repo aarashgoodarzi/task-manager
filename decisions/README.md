@@ -13,7 +13,8 @@ file and the older record is marked `Superseded by NNNN`.
 | [0001](0001-clean-architecture.md) | Clean Architecture as the service architecture | Accepted | Whole repository; package boundaries under `cmd/` and `internal/` |
 | [0002](0002-package-layout-and-composition-root.md) | Feature-oriented package layout and a single composition root | Accepted | `cmd/task-manager/`, `internal/app/`, `internal/infra/*` |
 | [0003](0003-postgres-via-database-sql.md) | PostgreSQL through `database/sql` and pgx, without an ORM | Accepted (migration strategy amended by 0006) | `internal/infra/database/`, `internal/task/repository/` |
-| [0004](0004-startup-errors-and-health-endpoint.md) | Startup errors returned to the process edge; shallow health endpoint | Accepted | `internal/app/`, `cmd/task-manager/`, `internal/infra/server/` |
+| [0004](0004-startup-errors-and-health-endpoint.md) | Startup errors returned to the process edge; shallow health endpoint | Accepted (database requirement amended by 0005) | `internal/app/`, `cmd/task-manager/`, `internal/infra/server/` |
+| [0005](0005-task-crud-api.md) | Task CRUD on a service-owned repository port | Accepted | `internal/task/**`, `internal/infra/handler/`, `internal/infra/server/`, `internal/app/` |
 | [0006](0006-postgres-task-persistence.md) | Task persistence in PostgreSQL: table, versioned migrations, explicit-SQL repository | Accepted | `internal/infra/database/`, `internal/task/repository/postgres/`, `cmd/migrate/` |
 
 ## When to write one
