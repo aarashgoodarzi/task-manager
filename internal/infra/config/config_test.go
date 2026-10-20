@@ -5,7 +5,31 @@ import (
 	"time"
 )
 
+// clearConfigEnv removes ambient configuration so tests that assert defaults
+// are not affected by variables exported by the developer's shell or runner.
+// Load treats an empty value as unset, which is the production behavior.
+func clearConfigEnv(t *testing.T) {
+	t.Helper()
+
+	for _, key := range []string{
+		"PORT",
+		"SERVER_READ_HEADER_TIMEOUT",
+		"SERVER_READ_TIMEOUT",
+		"SERVER_WRITE_TIMEOUT",
+		"SERVER_IDLE_TIMEOUT",
+		"DATABASE_URL",
+		"DATABASE_MAX_OPEN_CONNS",
+		"DATABASE_MAX_IDLE_CONNS",
+		"DATABASE_CONN_MAX_LIFETIME",
+		"LOG_LEVEL",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
+	clearConfigEnv(t)
+
 	cfg := Load()
 
 	if cfg.Server.Addr != ":8080" {
@@ -23,6 +47,8 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestLoadReadsEnvOverrides(t *testing.T) {
+	clearConfigEnv(t)
+
 	t.Setenv("PORT", "9090")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/task_manager?sslmode=disable")
 	t.Setenv("DATABASE_MAX_OPEN_CONNS", "25")
@@ -49,6 +75,8 @@ func TestLoadReadsEnvOverrides(t *testing.T) {
 }
 
 func TestLoadIgnoresInvalidIntOverride(t *testing.T) {
+	clearConfigEnv(t)
+
 	t.Setenv("DATABASE_MAX_OPEN_CONNS", "not-a-number")
 
 	cfg := Load()

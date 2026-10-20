@@ -42,10 +42,10 @@ runs on pushes to `main`, on every pull request, and on manual dispatch:
 - **Credentials stay in the workflow, not in the repository.** The literals
   grant access only to that ephemeral container. No repository secret is
   required, and no production DSN is ever referenced.
-- **`TEST_DATABASE_URL` is job-level; `DATABASE_URL` is not.** The
-  configuration tests assert unset defaults, so exporting `DATABASE_URL`
-  globally would make them fail for the wrong reason. Only the migration step
-  sets `DATABASE_URL`, which also exercises the documented `cmd/migrate` path.
+- **`TEST_DATABASE_URL` is job-level; `DATABASE_URL` is not.** Configuration
+  tests clear the variables they assert on, so a global `DATABASE_URL` would
+  not change their result; keeping it step-scoped still makes the migration's
+  dependency explicit and exercises the documented `cmd/migrate` path.
 - **The database-free tier stays explicit.** The unit-test step clears
   `TEST_DATABASE_URL`, so it runs the same suite a developer runs without
   PostgreSQL; the integration step then runs everything against the service.

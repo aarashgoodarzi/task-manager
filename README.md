@@ -552,10 +552,9 @@ The suite has two tiers:
   variable and asserts that these tests executed; see
   [Continuous Integration](#continuous-integration).
 
-The configuration tests read the process environment directly, so run them with
-no overriding `PORT`, `DATABASE_URL`, `DATABASE_MAX_OPEN_CONNS`, `SERVER_*`, or
-`LOG_LEVEL` values in your shell — a preset `PORT` makes `TestLoadDefaults`
-fail. Use `env -u PORT` for a clean run if needed.
+The configuration tests clear the variables they assert on before loading, so
+they are deterministic and do not depend on the shell environment. A preset
+`PORT`, `DATABASE_URL`, or logging variable cannot change their result.
 
 | Task | Command |
 | --- | --- |
@@ -632,8 +631,9 @@ pinned minor version) with an ephemeral `task_manager_test` database and a
 Environment rules that matter:
 
 - `TEST_DATABASE_URL` is defined at job level; `DATABASE_URL` is set only for
-  the migration step. The configuration tests assert unset defaults, so a global
-  `DATABASE_URL` would break them for the wrong reason.
+  the migration step. Configuration tests clear the variables they assert on, so
+  neither placement changes their result; the migration step still exercises the
+  documented `cmd/migrate` path.
 - The credentials in the workflow belong to the ephemeral service container and
   are not secrets. No repository secret or production DSN is used.
 - Database-backed commands pass `-p 1` and no test uses `t.Parallel`. Every CI
