@@ -21,6 +21,7 @@ file and the older record is marked `Superseded by NNNN`.
 | [0009](0009-openapi-contract.md) | A checked-in OpenAPI document as the HTTP contract | Accepted | `api/`, `internal/infra/swagger/`, `internal/infra/server/`, `internal/app/` |
 | [0010](0010-prometheus-metrics-and-request-correlation.md) | Prometheus metrics and request correlation for HTTP observability | Accepted | `internal/infra/metrics/`, `internal/infra/server/`, `internal/task/repository/postgres/`, `internal/infra/config/`, `internal/app/` |
 | [0011](0011-http-handler-composition.md) | One composition point for HTTP module handlers | Accepted | `internal/app/`, `internal/infra/server/`, `internal/task/handler/`, `internal/infra/swagger/` |
+| [0012](0012-consumer-owned-ports-dependency-audit.md) | Consumer-owned ports remain the dependency-inversion boundary | Accepted | Whole repository; audited `internal/task/**`, `internal/infra/**`, `internal/app/`, `cmd/` |
 
 ## When to write one
 
