@@ -34,7 +34,7 @@ structured request log. A multi-stage Docker image and a
 | Task domain model, statuses, validation, and UUID identifiers | Implemented |
 | Task service use cases behind a repository interface | Implemented |
 | PostgreSQL task repository using explicit SQL | Implemented |
-| CRUD endpoints: `POST/GET/PUT/DELETE /tasks` | Implemented |
+| CRUD endpoints: `POST /task` and `GET/PUT/DELETE /tasks` | Implemented |
 | Uniform JSON error envelope and `404` / `405` handling | Implemented |
 | OpenAPI 3.0.3 contract and embedded Swagger UI | Implemented |
 | Unit, service, HTTP, PostgreSQL integration, and docs tests | Implemented |
@@ -114,16 +114,20 @@ tests; its name must contain `test` because the repository tests truncate the
 
 ### Option A: Docker Compose
 
-The shortest path starts PostgreSQL, applies migrations, and runs the API:
+This path needs no local Go toolchain, database, or manual migration. Compose
+starts PostgreSQL, waits for its health check, runs the one-shot `migrate`
+service, and only then starts `app`:
 
 ```bash
 docker compose up -d --build
-docker compose ps
+docker compose ps          # wait until the app service is healthy
 ```
 
-Compose starts the `postgres` service first, waits for its health check, runs
-the one-shot `migrate` service, and only then starts `app`. Wait until the `app`
-service is healthy, then verify it:
+Migrations are applied automatically by the `migrate` service; the API never
+migrates at startup. The local Go path in Option B requires the explicit
+`make migrate` step instead.
+
+Wait until the `app` service is healthy, then verify it:
 
 ```bash
 curl -s http://localhost:8080/health
@@ -139,16 +143,27 @@ curl -si http://localhost:8080/health/live | grep -i '^x-request-id'
 # X-Request-ID: 6f1c... (generated when the request did not supply one)
 ```
 
-Open the interactive API documentation at:
+Open Swagger UI and the raw contract on the running service:
 
-- <http://localhost:8080/swagger/>
-- <http://localhost:8080/swagger/index.html>
+| URL | Content |
+| --- | --- |
+| <http://localhost:8080/swagger/index.html> | Swagger UI |
+| <http://localhost:8080/swagger/> | Swagger entry point; the trailing slash matters |
+| <http://localhost:8080/swagger/openapi.yaml> | Raw OpenAPI 3.0.3 document, served as `application/yaml` |
 
-If port `8080` is already in use, publish another host port:
+The UI and the specification are embedded in the binary, so no extra service,
+CDN, or asset directory is required.
+
+The application always listens on port `8080` inside the container. Compose
+publishes it on the host as `${APP_PORT:-8080}`; `APP_PORT` changes only the
+host side. If `8080` is already in use:
 
 ```bash
 APP_PORT=9090 docker compose up -d --build
 curl -s http://localhost:9090/health
+# Swagger then moves with the host port:
+#   http://localhost:9090/swagger/index.html
+#   http://localhost:9090/swagger/openapi.yaml
 ```
 
 Follow logs and stop the stack:
@@ -345,7 +360,7 @@ Base URL for the examples: `http://localhost:8080`.
 
 | Method | Path | Purpose | Success | Request body |
 | --- | --- | --- | --- | --- |
-| `POST` | `/tasks` | Create a task | `201` with the task and a `Location: /tasks/{id}` header | Required |
+| `POST` | `/task` | Create a task | `201` with the task and a `Location: /tasks/{id}` header | Required |
 | `GET` | `/tasks` | List every task ordered by `id` ascending | `200` with a JSON array, `[]` when empty | None |
 | `GET` | `/tasks/{id}` | Retrieve one task | `200` with the task | None |
 | `PUT` | `/tasks/{id}` | Replace the mutable fields of a task | `200` with the replaced task | Required |
@@ -388,7 +403,7 @@ Additional behavior:
 #### Create a task
 
 ```bash
-curl -i -X POST http://localhost:8080/tasks \
+curl -i -X POST http://localhost:8080/task \
   -H 'Content-Type: application/json' \
   -d '{"title":"Write the report","description":"Cover the API contract","status":"in_progress"}'
 ```

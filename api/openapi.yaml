@@ -61,6 +61,7 @@ paths:
           $ref: '#/components/responses/MethodNotAllowed'
         '500':
           $ref: '#/components/responses/InternalError'
+  /task:
     post:
       tags:
         - Tasks
@@ -71,6 +72,11 @@ paths:
         required and trimmed of leading and trailing whitespace before storage;
         `description` defaults to an empty string, is stored as sent, and
         `status` defaults to `todo`.
+
+        Creation is served at `/task`; the collection path `/tasks` is
+        read-only. The created task is returned with a `Location` header
+        pointing at `/tasks/{id}`, which is where it can be read, replaced, and
+        deleted.
       requestBody:
         required: true
         description: The task to create.

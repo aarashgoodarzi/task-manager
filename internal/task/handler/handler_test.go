@@ -154,7 +154,7 @@ func decodeError(t *testing.T, rec *httptest.ResponseRecorder) infraHandler.Resp
 func TestCreateTask(t *testing.T) {
 	router := newTaskRouter()
 
-	rec := doRequest(router, http.MethodPost, "/tasks",
+	rec := doRequest(router, http.MethodPost, "/task",
 		`{"title":"  write documentation  ","description":"phase 1.5"}`)
 
 	if rec.Code != http.StatusCreated {
@@ -189,7 +189,7 @@ func TestCreateTask(t *testing.T) {
 }
 
 func TestCreateTaskWithExplicitStatus(t *testing.T) {
-	rec := doRequest(newTaskRouter(), http.MethodPost, "/tasks",
+	rec := doRequest(newTaskRouter(), http.MethodPost, "/task",
 		`{"title":"ship it","status":"in_progress"}`)
 
 	if rec.Code != http.StatusCreated {
@@ -197,6 +197,29 @@ func TestCreateTaskWithExplicitStatus(t *testing.T) {
 	}
 	if task := decodeTask(t, rec); task.Status != domain.StatusInProgress {
 		t.Fatalf("status = %q, want %q", task.Status, domain.StatusInProgress)
+	}
+}
+
+// TestPostToCollectionDoesNotCreateTask pins the route contract: creation lives
+// on /task, and the collection path accepts reads only. Gin answers 405 because
+// /tasks is a registered path with a different method, exactly as the
+// production router does (HandleMethodNotAllowed is enabled there).
+func TestPostToCollectionDoesNotCreateTask(t *testing.T) {
+	router := gin.New()
+	router.HandleMethodNotAllowed = true
+	New(service.New(newStubRepository()), discardLogger()).RegisterRoutes(router)
+
+	rec := doRequest(router, http.MethodPost, "/tasks", `{"title":"must not be created"}`)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405, body = %s", rec.Code, rec.Body.String())
+	}
+
+	listed := doRequest(router, http.MethodGet, "/tasks", "")
+	if listed.Code != http.StatusOK {
+		t.Fatalf("GET /tasks status = %d, want 200", listed.Code)
+	}
+	if tasks := decodeTasks(t, listed); len(tasks) != 0 {
+		t.Fatalf("POST /tasks created %d task(s), want none", len(tasks))
 	}
 }
 
@@ -215,7 +238,7 @@ func TestCreateTaskRejectsMalformedJSON(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := doRequest(newTaskRouter(), http.MethodPost, "/tasks", tc.body)
+			rec := doRequest(newTaskRouter(), http.MethodPost, "/task", tc.body)
 
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
@@ -245,7 +268,7 @@ func TestCreateTaskRejectsInvalidFields(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := doRequest(newTaskRouter(), http.MethodPost, "/tasks", tc.body)
+			rec := doRequest(newTaskRouter(), http.MethodPost, "/task", tc.body)
 
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
@@ -276,7 +299,7 @@ func TestListTasksPopulated(t *testing.T) {
 	router := newTaskRouter()
 
 	for _, title := range []string{"first", "second"} {
-		rec := doRequest(router, http.MethodPost, "/tasks", `{"title":"`+title+`"}`)
+		rec := doRequest(router, http.MethodPost, "/task", `{"title":"`+title+`"}`)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("create %q status = %d, want 201", title, rec.Code)
 		}
@@ -316,7 +339,7 @@ func TestGetTaskNotFound(t *testing.T) {
 func TestUpdateTask(t *testing.T) {
 	router := newTaskRouter()
 
-	created := decodeTask(t, doRequest(router, http.MethodPost, "/tasks", `{"title":"old title"}`))
+	created := decodeTask(t, doRequest(router, http.MethodPost, "/task", `{"title":"old title"}`))
 
 	rec := doRequest(router, http.MethodPut, "/tasks/"+created.ID,
 		`{"title":"new title","description":"new description","status":"done"}`)
@@ -339,7 +362,7 @@ func TestUpdateTask(t *testing.T) {
 func TestUpdateTaskReplacesWithoutStatusDefaulting(t *testing.T) {
 	router := newTaskRouter()
 
-	created := decodeTask(t, doRequest(router, http.MethodPost, "/tasks", `{"title":"task","status":"done"}`))
+	created := decodeTask(t, doRequest(router, http.MethodPost, "/task", `{"title":"task","status":"done"}`))
 
 	// PUT is a full replacement: omitting status resets it to the default.
 	rec := doRequest(router, http.MethodPut, "/tasks/"+created.ID, `{"title":"task"}`)
@@ -364,7 +387,7 @@ func TestUpdateTaskNotFound(t *testing.T) {
 
 func TestUpdateTaskRejectsInvalidInput(t *testing.T) {
 	router := newTaskRouter()
-	created := decodeTask(t, doRequest(router, http.MethodPost, "/tasks", `{"title":"task"}`))
+	created := decodeTask(t, doRequest(router, http.MethodPost, "/task", `{"title":"task"}`))
 
 	tests := []struct {
 		name string
@@ -387,7 +410,7 @@ func TestUpdateTaskRejectsInvalidInput(t *testing.T) {
 
 func TestDeleteTask(t *testing.T) {
 	router := newTaskRouter()
-	created := decodeTask(t, doRequest(router, http.MethodPost, "/tasks", `{"title":"disposable"}`))
+	created := decodeTask(t, doRequest(router, http.MethodPost, "/task", `{"title":"disposable"}`))
 
 	rec := doRequest(router, http.MethodDelete, "/tasks/"+created.ID, "")
 	if rec.Code != http.StatusNoContent {
@@ -449,7 +472,7 @@ func TestTaskLifecycle(t *testing.T) {
 	router := newTaskRouter()
 
 	// Create.
-	createRec := doRequest(router, http.MethodPost, "/tasks",
+	createRec := doRequest(router, http.MethodPost, "/task",
 		`{"title":"lifecycle","description":"initial","status":"todo"}`)
 	if createRec.Code != http.StatusCreated {
 		t.Fatalf("create status = %d, want 201", createRec.Code)
@@ -523,7 +546,7 @@ func TestInternalErrorsAreNotLeaked(t *testing.T) {
 		path   string
 		body   string
 	}{
-		{method: http.MethodPost, path: "/tasks", body: `{"title":"task"}`},
+		{method: http.MethodPost, path: "/task", body: `{"title":"task"}`},
 		{method: http.MethodGet, path: "/tasks"},
 		{method: http.MethodGet, path: "/tasks/" + unknownID},
 		{method: http.MethodPut, path: "/tasks/" + unknownID, body: `{"title":"task"}`},

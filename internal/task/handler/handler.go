@@ -41,7 +41,9 @@ func New(svc TaskService, log *slog.Logger) *Handler {
 
 // RegisterRoutes mounts the task endpoints on r.
 func (h *Handler) RegisterRoutes(r gin.IRouter) {
-	r.POST("/tasks", h.create)
+	// Creation is a separate path from the collection resource: /tasks is
+	// read-only, and the created task lives at /tasks/{id}.
+	r.POST("/task", h.create)
 	r.GET("/tasks", h.list)
 	r.GET("/tasks/:id", h.get)
 	r.PUT("/tasks/:id", h.update)

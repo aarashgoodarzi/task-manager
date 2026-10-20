@@ -50,6 +50,11 @@ func TestOpenAPIIsServed(t *testing.T) {
 			t.Fatalf("document does not mention %q", path)
 		}
 	}
+	// Creation is documented on /task, and only there; the bare substring
+	// check above cannot distinguish the two paths.
+	if !strings.Contains(rec.Body.String(), "\n  /task:\n") {
+		t.Fatal("document does not define the creation path /task")
+	}
 }
 
 func TestSwaggerUIIsServedAtBasePath(t *testing.T) {
