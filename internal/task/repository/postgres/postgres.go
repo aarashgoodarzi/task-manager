@@ -92,6 +92,23 @@ func (r *Repository) List(ctx context.Context) ([]domain.Task, error) {
 	return tasks, nil
 }
 
+// CountTasks returns the number of rows currently in the tasks table. It is a
+// full-table count, so the metrics refresher calls it on its own schedule
+// rather than the HTTP layer calling it per request. It reads the database, not
+// an adapter-local counter, so tasks created or deleted by another process (or
+// by direct SQL) are included.
+func (r *Repository) CountTasks(ctx context.Context) (int64, error) {
+	if r.db == nil {
+		return 0, fmt.Errorf("postgres: count tasks: nil pool")
+	}
+
+	var count int64
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM tasks`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("postgres: count tasks: %w", err)
+	}
+	return count, nil
+}
+
 // Get returns the task with the given identifier, or service.ErrNotFound.
 func (r *Repository) Get(ctx context.Context, id string) (domain.Task, error) {
 	task, err := scanTask(r.db.QueryRowContext(ctx,

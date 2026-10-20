@@ -48,7 +48,12 @@ func discardLogger() *slog.Logger {
 
 func newTestServer(t *testing.T, db HealthChecker, modules ...RouteRegistrar) *Server {
 	t.Helper()
-	return New(Config{Addr: ":0"}, discardLogger(), db, modules...)
+	return newTestServerWith(t, db, nil, discardLogger(), modules...)
+}
+
+func newTestServerWith(t *testing.T, db HealthChecker, instr Instrumentation, log *slog.Logger, modules ...RouteRegistrar) *Server {
+	t.Helper()
+	return New(Config{Addr: ":0"}, log, db, instr, modules...)
 }
 
 func serve(s *Server, method, path string) *httptest.ResponseRecorder {

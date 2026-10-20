@@ -239,6 +239,49 @@ func TestListReturnsTasksOrderedByID(t *testing.T) {
 	}
 }
 
+func TestCountTasksRejectsNilPool(t *testing.T) {
+	if _, err := New(nil).CountTasks(context.Background()); err == nil {
+		t.Fatal("CountTasks() with a nil pool: want error, got nil")
+	}
+}
+
+// TestCountTasksReflectsPersistedState proves the metric source is the table,
+// not an adapter-local counter: deletions and writes from another connection
+// are both visible.
+func TestCountTasksReflectsPersistedState(t *testing.T) {
+	repo, db := newTestRepository(t)
+	ctx := context.Background()
+
+	if got, err := repo.CountTasks(ctx); err != nil || got != 0 {
+		t.Fatalf("CountTasks() = %d, %v; want 0, nil on an empty table", got, err)
+	}
+
+	first := mustCreate(t, repo, "first")
+	mustCreate(t, repo, "second")
+
+	if got, err := repo.CountTasks(ctx); err != nil || got != 2 {
+		t.Fatalf("CountTasks() = %d, %v; want 2, nil after two creates", got, err)
+	}
+
+	// Simulate a writer outside this process, for example a manual statement.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO tasks (id, title, description, status)
+		 VALUES ('55555555-5555-4555-8555-555555555555', 'external', '', 'todo')`,
+	); err != nil {
+		t.Fatalf("insert external task: %v", err)
+	}
+	if got, err := repo.CountTasks(ctx); err != nil || got != 3 {
+		t.Fatalf("CountTasks() = %d, %v; want 3, nil after an external insert", got, err)
+	}
+
+	if err := repo.Delete(ctx, first.ID); err != nil {
+		t.Fatalf("Delete() unexpected error: %v", err)
+	}
+	if got, err := repo.CountTasks(ctx); err != nil || got != 2 {
+		t.Fatalf("CountTasks() = %d, %v; want 2, nil after a delete", got, err)
+	}
+}
+
 func TestGetExisting(t *testing.T) {
 	repo, _ := newTestRepository(t)
 	created := mustCreate(t, repo, "stored")

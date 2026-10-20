@@ -22,6 +22,7 @@ func clearConfigEnv(t *testing.T) {
 		"DATABASE_MAX_IDLE_CONNS",
 		"DATABASE_CONN_MAX_LIFETIME",
 		"LOG_LEVEL",
+		"METRICS_TASKS_REFRESH_INTERVAL",
 	} {
 		t.Setenv(key, "")
 	}
@@ -44,6 +45,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Logger.Level != "info" {
 		t.Fatalf("Logger.Level = %q, want %q", cfg.Logger.Level, "info")
 	}
+	if cfg.Metrics.TasksRefreshInterval != 15*time.Second {
+		t.Fatalf("Metrics.TasksRefreshInterval = %v, want 15s", cfg.Metrics.TasksRefreshInterval)
+	}
 }
 
 func TestLoadReadsEnvOverrides(t *testing.T) {
@@ -54,6 +58,7 @@ func TestLoadReadsEnvOverrides(t *testing.T) {
 	t.Setenv("DATABASE_MAX_OPEN_CONNS", "25")
 	t.Setenv("SERVER_READ_TIMEOUT", "2s")
 	t.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("METRICS_TASKS_REFRESH_INTERVAL", "30s")
 
 	cfg := Load()
 
@@ -72,6 +77,9 @@ func TestLoadReadsEnvOverrides(t *testing.T) {
 	if cfg.Logger.Level != "debug" {
 		t.Fatalf("Logger.Level = %q, want %q", cfg.Logger.Level, "debug")
 	}
+	if cfg.Metrics.TasksRefreshInterval != 30*time.Second {
+		t.Fatalf("Metrics.TasksRefreshInterval = %v, want 30s", cfg.Metrics.TasksRefreshInterval)
+	}
 }
 
 func TestLoadIgnoresInvalidIntOverride(t *testing.T) {
@@ -83,5 +91,22 @@ func TestLoadIgnoresInvalidIntOverride(t *testing.T) {
 
 	if cfg.Database.MaxOpenConns != 10 {
 		t.Fatalf("Database.MaxOpenConns = %d, want fallback 10", cfg.Database.MaxOpenConns)
+	}
+}
+
+// TestLoadRejectsNonPositiveRefreshInterval proves a bad value cannot reach the
+// refresher, where a non-positive ticker interval would panic.
+func TestLoadRejectsNonPositiveRefreshInterval(t *testing.T) {
+	for _, value := range []string{"0s", "-5s", "not-a-duration"} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("METRICS_TASKS_REFRESH_INTERVAL", value)
+
+			cfg := Load()
+
+			if cfg.Metrics.TasksRefreshInterval != 15*time.Second {
+				t.Fatalf("Metrics.TasksRefreshInterval = %v, want the 15s fallback", cfg.Metrics.TasksRefreshInterval)
+			}
+		})
 	}
 }

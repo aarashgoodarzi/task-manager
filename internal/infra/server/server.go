@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/aarashgoodarzi/task-manager/internal/infra/handler"
+	"github.com/aarashgoodarzi/task-manager/internal/infra/metrics"
 )
 
 // HealthChecker is the only capability the server needs from the database
@@ -31,6 +32,16 @@ type RouteRegistrar interface {
 	RegisterRoutes(r gin.IRouter)
 }
 
+// Instrumentation is the observability adapter the server records completed
+// requests on and mounts at metrics.Path. It is declared here, at the point of
+// use; *metrics.Metrics satisfies it. A nil value disables instrumentation and
+// the /metrics route (tests use that; the composition root always supplies
+// one).
+type Instrumentation interface {
+	ObserveRequest(method, route string, status int, duration time.Duration)
+	Handler() http.Handler
+}
+
 // Config drives the HTTP listener and timeouts.
 type Config struct {
 	Addr              string
@@ -44,6 +55,7 @@ type Config struct {
 type Server struct {
 	log     *slog.Logger
 	db      HealthChecker
+	instr   Instrumentation
 	modules []RouteRegistrar
 	srv     *http.Server
 }
@@ -52,8 +64,8 @@ type Server struct {
 // database checker /health pings; a nil value makes /health report 503, since a
 // process without persistence is not ready. Tests construct the server that way
 // but the composition root always supplies a pool.
-func New(cfg Config, log *slog.Logger, db HealthChecker, modules ...RouteRegistrar) *Server {
-	s := &Server{log: log, db: db, modules: modules}
+func New(cfg Config, log *slog.Logger, db HealthChecker, instr Instrumentation, modules ...RouteRegistrar) *Server {
+	s := &Server{log: log, db: db, instr: instr, modules: modules}
 	s.srv = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.buildRouter(),
@@ -96,7 +108,16 @@ func (s *Server) buildRouter() *gin.Engine {
 	r := gin.New()
 	r.HandleMethodNotAllowed = true
 	r.Use(gin.Recovery())
-	r.Use(s.requestLogger())
+	r.Use(requestIDMiddleware())
+	r.Use(s.observeRequests())
+
+	if s.instr != nil {
+		// gin.WrapH hands the ResponseWriter and request to the standard
+		// Prometheus handler. observeRequests skips this route, so scrapes do
+		// not appear in requests_total or request_latency_histogram.
+		r.GET(metrics.Path, gin.WrapH(s.instr.Handler()))
+	}
+
 	r.GET("/health", s.handleHealth)
 	r.GET("/health/live", s.handleLive)
 
@@ -140,18 +161,67 @@ func (s *Server) handleHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "database": "ok"})
 }
 
-func (s *Server) requestLogger() gin.HandlerFunc {
+// observeRequests logs every completed request and records it in the metrics
+// adapter. It uses a deferred completion block so a panic unwinding through the
+// handler still produces a log line and a metric, then re-panics for
+// gin.Recovery to write the 500 response.
+func (s *Server) observeRequests() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
+
+		var recovered any
+		panicked := false
+		defer func() {
+			if rec := recover(); rec != nil {
+				recovered = rec
+				panicked = true
+			}
+
+			status := c.Writer.Status()
+			if panicked {
+				// gin.Recovery has not written the response yet; record the
+				// status it is about to produce instead of a misleading 200.
+				status = http.StatusInternalServerError
+			}
+
+			// FullPath is the registered pattern (/tasks/:id), not the concrete
+			// URL, so identifiers never become metric labels. Requests that
+			// matched no route share one bounded label instead of one per path.
+			route := c.FullPath()
+			if route == "" {
+				route = metrics.UnmatchedRoute
+			}
+			duration := time.Since(start)
+
+			// The scrape endpoint is logged but never instrumented, so observing
+			// metrics cannot recursively observe itself.
+			if s.instr != nil && route != metrics.Path {
+				s.instr.ObserveRequest(c.Request.Method, route, status, duration)
+			}
+
+			if s.log != nil {
+				attrs := []slog.Attr{
+					slog.String("request_id", RequestID(c)),
+					slog.String("method", c.Request.Method),
+					slog.String("path", c.Request.URL.Path),
+					slog.String("route", route),
+					slog.Int("status", status),
+					slog.Duration("duration", duration),
+					slog.Int("bytes", c.Writer.Size()),
+				}
+				if panicked {
+					// The panic value and stack are programmer diagnostics; the
+					// value can contain data, so only its occurrence is logged here.
+					attrs = append(attrs, slog.Bool("panic", true))
+				}
+				s.log.LogAttrs(c.Request.Context(), slog.LevelInfo, "request", attrs...)
+			}
+
+			if panicked {
+				panic(recovered)
+			}
+		}()
+
 		c.Next()
-		if s.log == nil {
-			return
-		}
-		s.log.Info("request",
-			slog.String("method", c.Request.Method),
-			slog.String("path", c.Request.URL.Path),
-			slog.Int("status", c.Writer.Status()),
-			slog.Duration("duration", time.Since(start)),
-		)
 	}
 }

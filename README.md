@@ -11,9 +11,11 @@ reachable PostgreSQL server, or without the expected schema it refuses to start.
 The schema is versioned and embedded in the binary, but migrations are applied
 by a separate command, never by application startup.
 
-An OpenAPI 3.0.3 contract and an offline Swagger UI are served by the service. A
-multi-stage Docker image and a [Compose environment](#9-docker-compose) run the
-complete stack locally.
+An OpenAPI 3.0.3 contract and an offline Swagger UI are served by the service.
+Prometheus metrics are exposed at `GET /metrics`, and every request is
+correlated by an `X-Request-ID` that appears in the response and in the
+structured request log. A multi-stage Docker image and a
+[Compose environment](#9-docker-compose) run the complete stack locally.
 
 ## 1. Overview
 
@@ -25,7 +27,8 @@ complete stack locally.
 | PostgreSQL pool construction and DSN validation | Implemented |
 | Startup connectivity and schema verification (fail closed) | Implemented |
 | Versioned, embedded SQL migrations applied by `cmd/migrate` | Implemented |
-| HTTP server with recovery and request-logging middleware | Implemented |
+| HTTP server with recovery, request-ID correlation, and request logging | Implemented |
+| Prometheus metrics at `GET /metrics` | Implemented |
 | `GET /health` readiness and `GET /health/live` liveness | Implemented |
 | Graceful shutdown on `SIGINT` / `SIGTERM` | Implemented |
 | Task domain model, statuses, validation, and UUID identifiers | Implemented |
@@ -40,7 +43,8 @@ complete stack locally.
 | Authentication, authorization, and multi-tenancy | Not implemented |
 | Filtering, pagination, sorting controls, and search | Not implemented |
 | Task timestamps, priorities, tags, or soft delete | Not implemented |
-| Metrics and distributed tracing | Not implemented |
+| Metrics storage, dashboards, and alerting | Not implemented (the service exposes `/metrics`; no Prometheus server or Grafana is bundled) |
+| Distributed tracing (OpenTelemetry, spans, exporters) | Not implemented (requests are correlated within this process, not traced across services) |
 
 ### Technology stack
 
@@ -53,7 +57,9 @@ complete stack locally.
 | Migrations | Embedded `NNNN_description.sql` files applied by `cmd/migrate` |
 | API documentation | OpenAPI 3.0.3 at [`api/openapi.yaml`](api/openapi.yaml); embedded [Swagger UI](https://swagger.io/tools/swagger-ui/) via `swaggest/swgui` |
 | Containers | Multi-stage [`Dockerfile`](Dockerfile) (Alpine runtime, non-root) and [`compose.yaml`](compose.yaml) |
-| Logging | `log/slog` with a text handler |
+| Logging | `log/slog` with a text handler; one structured line per request, including `request_id` |
+| Metrics | [Prometheus Go client](https://github.com/prometheus/client_golang) with a dedicated registry, served at `/metrics` |
+| Request correlation | `X-Request-ID` propagation or generation; identifier stored in the Gin context |
 | Configuration | Standard-library `os.Getenv`, read once at startup |
 
 No ORM, external migration tool, or hosted documentation service is required.
@@ -68,7 +74,10 @@ sorting, search, or transition rules for status values.
 The service is intended to run against PostgreSQL. It has no volatile storage
 mode, no automatic database provisioning, and no migration-at-startup behavior.
 Production concerns such as authentication, authorization, rate limiting,
-metrics, tracing, and horizontal coordination are outside the current scope.
+metrics storage and dashboards, distributed tracing, and horizontal
+coordination are outside the current scope. The metrics endpoint is
+pull-based and in-process: the service exposes numbers, it does not store,
+aggregate, or alert on them.
 
 ## 2. Prerequisites
 
@@ -122,6 +131,12 @@ curl -s http://localhost:8080/health
 
 curl -s http://localhost:8080/tasks
 # [] on a fresh database
+
+curl -s http://localhost:8080/metrics | head
+# Prometheus text exposition: requests_total, request_latency_histogram, ...
+
+curl -si http://localhost:8080/health/live | grep -i '^x-request-id'
+# X-Request-ID: 6f1c... (generated when the request did not supply one)
 ```
 
 Open the interactive API documentation at:
@@ -190,6 +205,7 @@ Verify the service from another terminal:
 curl -s http://localhost:8080/health
 curl -s http://localhost:8080/health/live
 curl -s http://localhost:8080/tasks
+curl -s http://localhost:8080/metrics | head
 ```
 
 To build a binary instead of running through `go run`:
@@ -224,6 +240,7 @@ loaded in the composition root described by
 | `DATABASE_MAX_IDLE_CONNS` | No | `5` | Maximum idle connections retained. |
 | `DATABASE_CONN_MAX_LIFETIME` | No | `30m` | Maximum lifetime of a pooled connection. |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warn`, or `error`; any other value falls back to `info`. |
+| `METRICS_TASKS_REFRESH_INTERVAL` | No | `15s` | How often `tasks_count` is re-read from PostgreSQL. Zero, negative, and unparsable values fall back to `15s`. |
 | `TEST_DATABASE_URL` | No | *(empty)* | Test-only DSN for integration tests; the service ignores it. |
 | `GIN_MODE` | No | `debug` | Read by Gin, not by the application configuration. `release` silences Gin's debug output. |
 
@@ -232,8 +249,10 @@ Behavior worth knowing:
 - Empty optional values are treated as unset. For example, `PORT=` behaves like
   leaving `PORT` out.
 - Invalid numeric or duration values fall back to their defaults rather than
-  failing startup. `DATABASE_URL` is different: an empty or malformed value
-  aborts startup before the HTTP listener binds.
+  failing startup. A non-positive `METRICS_TASKS_REFRESH_INTERVAL` is replaced
+  by `15s` because a non-positive ticker interval would panic. `DATABASE_URL`
+  is different: an empty or malformed value aborts startup before the HTTP
+  listener binds.
 - `DATABASE_URL` is validated with `pgx.ParseConfig`; the process pings the
   server and verifies the `tasks` table before serving requests.
 
@@ -458,6 +477,110 @@ The readiness check verifies connectivity only, not schema or data. Schema
 presence is verified once, at startup. Undefined methods on a known health path
 return `405`; unknown routes return `404`, both with the error envelope.
 
+### Metrics endpoint
+
+`GET /metrics` returns the standard Prometheus text exposition format
+(`text/plain; version=0.0.4`) from a registry dedicated to this service. It is
+not a JSON endpoint and is deliberately absent from `api/openapi.yaml`; the
+design is recorded in
+[ADR 0010](decisions/0010-prometheus-metrics-and-request-correlation.md).
+
+```bash
+curl -s http://localhost:8080/metrics
+curl -s http://localhost:8080/metrics | grep '^tasks_count'
+```
+
+Representative excerpt (series appear once they have been observed):
+
+```text
+# HELP requests_total Total number of HTTP requests handled, by method, route, and status code.
+# TYPE requests_total counter
+requests_total{method="GET",route="/tasks/:id",status="200"} 3
+# HELP request_latency_histogram HTTP request duration in seconds, by method, route, and status code.
+# TYPE request_latency_histogram histogram
+request_latency_histogram_bucket{method="GET",route="/tasks/:id",status="200",le="0.01"} 3
+...
+# HELP tasks_count Current number of tasks persisted in PostgreSQL.
+# TYPE tasks_count gauge
+tasks_count 2
+# HELP tasks_count_last_refresh_timestamp_seconds Unix timestamp of the last successful tasks_count refresh.
+# TYPE tasks_count_last_refresh_timestamp_seconds gauge
+tasks_count_last_refresh_timestamp_seconds 1.729500123e+09
+```
+
+| Metric | Type | Labels | Unit | Meaning |
+| --- | --- | --- | --- | --- |
+| `requests_total` | Counter | `method`, `route`, `status` | requests | Completed HTTP requests, including `4xx` and `5xx`. |
+| `request_latency_histogram` | Histogram | `method`, `route`, `status` | seconds | Request duration, measured from the start of the middleware to completion. |
+| `tasks_count` | Gauge | none | tasks | Last successfully observed `count(*)` of the `tasks` table. |
+| `tasks_count_last_refresh_timestamp_seconds` | Gauge | none | Unix seconds | When `tasks_count` was last refreshed successfully. |
+
+Label and measurement rules:
+
+- `route` is the registered Gin pattern (`/tasks/:id`), never the concrete URL,
+  so task IDs do not create series. Requests that match no route, including
+  `404` and `405` responses, share the single value `unmatched`.
+- `method` is a standard HTTP verb; any other token is recorded as `other`.
+- `status` is the numeric HTTP status code as a string.
+- Latency uses seconds and buckets from `0.001` to `10`. Both successes and
+  failures are recorded.
+- Scrapes of `/metrics` are excluded from `requests_total` and
+  `request_latency_histogram`. The endpoint is still request-logged, and
+  `promhttp`'s own handler metrics are not registered, so a scrape cannot
+  instrument itself.
+
+`tasks_count` consistency model:
+
+- It comes from PostgreSQL (`SELECT count(*) FROM tasks`), not from a
+  process-local counter. Creates, deletes, restarts, and writes from another
+  process or a manual statement are all reflected at the next refresh.
+- It is refreshed at startup and then every
+  `METRICS_TASKS_REFRESH_INTERVAL` (default `15s`), never per request. It is
+  therefore eventually consistent, up to one interval plus one query duration
+  behind.
+- Before the first successful refresh, `tasks_count` and its timestamp are
+  absent rather than reporting `0`.
+- If PostgreSQL becomes unavailable, the last successful value and timestamp
+  remain (stale, not fabricated), a warning is logged on each failed refresh,
+  and the timestamp stops advancing. Use
+  `time() - tasks_count_last_refresh_timestamp_seconds` to detect staleness.
+- Refreshes are serialized, and shutdown cancels an in-flight count and waits
+  for the refresh loop before closing the pool.
+
+`/metrics` is unauthenticated because the whole API is. It exposes aggregate
+numbers and registered route patterns, never task titles, descriptions,
+request bodies, or credentials. Restrict it at the network or proxy layer if
+the service is reachable from an untrusted network.
+
+### Request correlation
+
+The service assigns every request an identifier and echoes it in the
+`X-Request-ID` response header:
+
+```bash
+curl -si -H 'X-Request-ID: client-trace-42' http://localhost:8080/health/live \
+  | grep -i '^x-request-id'
+# X-Request-ID: client-trace-42
+
+curl -si http://localhost:8080/health/live | grep -i '^x-request-id'
+# X-Request-ID: 9f2c4d... (32 lowercase hex characters, generated)
+```
+
+- A valid incoming `X-Request-ID` is propagated. Valid means 1–64 characters
+  from letters, digits, `.`, `_`, `:`, and `-`, starting with a letter or digit.
+- A missing, empty, malformed, or over-long value is replaced with a random
+  128-bit identifier encoded as 32 hex characters.
+- The final value is stored in the Gin context and available to downstream
+  handlers and middleware through `server.RequestID(c)` (or
+  `c.GetString(server.RequestIDContextKey)`).
+- Each structured request log line carries `request_id`, `method`, `path`,
+  `route`, `status`, `duration`, and `bytes`. Panics still produce a completion
+  log line and metric before `gin.Recovery` writes the `500`; the log records
+  `panic=true` without the panic value or stack.
+- This is request correlation within one process, **not distributed tracing**:
+  there are no spans, sampling, trace export, or propagation into PostgreSQL or
+  other services.
+
 ## 6. Architecture and Design
 
 Task Manager uses **Clean Architecture** as its architectural style. The
@@ -493,6 +616,10 @@ internal/task/repository/postgres (driven adapter, explicit SQL)
 `internal/task/domain` holds the aggregate and invariants and has no framework
 or driver imports. The docs adapter, `internal/infra/swagger`, depends on the
 embedded contract in `api` and on Gin; feature packages do not depend on it.
+The observability adapter, `internal/infra/metrics`, depends on the Prometheus
+client but not on Gin; the HTTP package calls it through a narrow
+`server.Instrumentation` interface and mounts its handler. Only the PostgreSQL
+repository knows how to count persisted tasks.
 
 ### Package responsibilities
 
@@ -503,14 +630,15 @@ embedded contract in `api` and on Gin; feature packages do not depend on it.
 | `internal/app` | Composition root: loads config, builds the logger and pool, verifies the schema, wires the task stack, docs adapter, and server, and shuts down in reverse order. |
 | `internal/infra/config` | Reads environment variables into plain structs and applies defaults. No network or filesystem I/O. |
 | `internal/infra/database` | Validates the DSN, opens the pooled `*sql.DB`, embeds and applies migrations, and verifies required tables. |
-| `internal/infra/server` | Builds the Gin router, middleware, health endpoints, feature modules, and `404`/`405` handlers; owns HTTP lifecycle. Declares the narrow `HealthChecker` and `RouteRegistrar` interfaces. |
+| `internal/infra/server` | Builds the Gin router, request-ID and completion middleware, health and metrics endpoints, feature modules, and `404`/`405` handlers; owns HTTP lifecycle. Declares the narrow `HealthChecker`, `RouteRegistrar`, and `Instrumentation` interfaces. |
 | `internal/infra/handler` | Shared HTTP delivery code: the JSON error envelope and error writer. |
+| `internal/infra/metrics` | Prometheus collectors in a dedicated registry, the `tasks_count` refresher, and the exposition handler. No Gin import; the registry is private. |
 | `internal/infra/swagger` | Docs adapter: serves the embedded spec and Swagger UI under `/swagger`; registers only `GET`. |
 | `api` | Embeds `api/openapi.yaml` as `api.OpenAPI`; no business or transport logic. |
 | `internal/task/domain` | `Task`, the closed `Status` set, validation, and UUID identifier format and generation. |
 | `internal/task/service` | Create, list, get, update, and delete use cases; declares the `Repository` interface it consumes. |
 | `internal/task/handler` | Strict request decoding, path-ID validation, response mapping, and error mapping; declares the `TaskService` interface it consumes. |
-| `internal/task/repository/postgres` | Explicit SQL CRUD, identifier generation, `sql.ErrNoRows` to `service.ErrNotFound`, and deterministic list order. |
+| `internal/task/repository/postgres` | Explicit SQL CRUD, identifier generation, `sql.ErrNoRows` to `service.ErrNotFound`, deterministic list order, and the `tasks` row count used by metrics. |
 
 ### Wiring and startup
 
@@ -526,11 +654,16 @@ then `Start`. The composition root performs the actual wiring:
    the pool and stops startup.
 6. The task repository, service, and handler are constructed, followed by the
    docs adapter.
-7. `server.New` receives the pool as the health checker and both HTTP adapters
-   as `RouteRegistrar` values. It builds the router with `gin.Recovery()`, the
-   request logger, health routes, `/swagger/`, and feature routes.
-8. `Start` installs a signal context for `SIGINT`/`SIGTERM`, runs the server,
-   shuts it down with a ten-second budget, and closes the pool.
+7. `metrics.New` builds a dedicated Prometheus registry, and a
+   `TaskCountRefresher` is wired to the task repository with the configured
+   refresh interval.
+8. `server.New` receives the pool as the health checker, the metrics adapter as
+   `Instrumentation`, and tasks plus docs as `RouteRegistrar` values. It builds
+   the router with `gin.Recovery()`, request-ID and completion middleware,
+   health routes, `/metrics`, `/swagger/`, and feature routes.
+9. `Start` installs a signal context for `SIGINT`/`SIGTERM`, starts the
+   task-count refresher, runs the server, shuts it down with a ten-second
+   budget, stops and waits for the refresher, and closes the pool.
 
 The server never imports the task packages or the database adapter. It knows
 only the narrow interfaces it declares itself:
@@ -574,6 +707,10 @@ internal/task/
    errors.
 8. Change the schema with a new `NNNN_` migration; never edit an applied one.
 9. Update `api/openapi.yaml` in the same change as any API contract change.
+10. Keep instrumentation in the infrastructure layer: handlers get request
+    metrics and request IDs from the shared middleware. Never import Gin or
+    Prometheus from `internal/task/domain` or `internal/task/service`, and do
+    not add a second task-count source beside PostgreSQL.
 
 ## 7. Database and Migrations
 
@@ -676,8 +813,8 @@ The CI and coverage decisions are recorded in
 tiers:
 
 - **Database-free tests** cover the domain, service use cases, HTTP handler,
-  router, docs adapter, configuration, and startup error paths. They run without
-  PostgreSQL.
+  router, request correlation, metrics, docs adapter, configuration, and startup
+  error paths. They run without PostgreSQL.
 - **PostgreSQL integration tests** cover the repository, migrations, and full
   app wiring. They run only when `TEST_DATABASE_URL` is set; otherwise they use
   `t.Skip` with an explicit message.
@@ -718,6 +855,18 @@ Important details:
   profile and prints the total but does not enforce the threshold.
 - Service and handler tests use hand-written fakes, not a mocking library. The
   PostgreSQL adapter is verified against a real server, not with SQL mocks.
+- `internal/infra/metrics` tests cover success and failure counters, histogram
+  units and buckets, bounded method/route labels, exposition output, scrape
+  exclusion, and registry isolation. Task-count tests cover the initial value,
+  refresh failures (no fabricated zero, stale value retained), cancellation,
+  periodic refresh, and serialized concurrent refreshes.
+- `internal/infra/server` tests cover generated and propagated request IDs,
+  invalid and oversized replacement, the response header on errors, log fields,
+  route-pattern labels, and panic recovery. A panicking handler must still
+  produce a completion log and a `500` metric observation.
+- The PostgreSQL suite includes `CountTasks` against a real table, including a
+  row inserted outside the repository, so the gauge's source of truth is
+  exercised rather than mocked.
 - `internal/app` tests cover a missing `DATABASE_URL`, a malformed DSN, an
   unreachable server, a missing schema, and successful PostgreSQL wiring.
 - `internal/infra/swagger` tests cover the exact embedded spec bytes, the UI
@@ -779,6 +928,10 @@ PostgreSQL is not published on the host. The `app` service reaches it at the
 service name `postgres:5432` using a DSN assembled from the `POSTGRES_*`
 variables. This avoids collisions with a local PostgreSQL on port 5432.
 
+Metrics use the same application port: `curl -s http://localhost:8080/metrics`
+(or `:${APP_PORT}` when overridden). No additional port is published, so
+PostgreSQL and other internal services stay unreachable from the host.
+
 If the migration fails, the `app` service is not started. Inspect the migration
 logs and re-run it:
 
@@ -820,6 +973,9 @@ docker build -t task-manager:local .
 | Fail-closed startup: ping and schema verification | The process never starts half-wired or serves requests that can only return `500` | Startup depends on database availability; there is no retry loop, so an orchestrator must restart it |
 | Migrations are explicit and not run by the app | Schema changes are reviewed and controlled independently of deploys | Deployments need a migration step; Compose models this as a one-shot service |
 | Hand-written OpenAPI contract with embedded Swagger UI | Clients get a machine-readable contract and offline docs; no CDN or asset directory | The spec can drift from handlers; updates require discipline and linting |
+| Pull-based Prometheus metrics in-process | Standard format and no agent or metrics backend is required; any scraper can consume it | The service does not store, aggregate, or alert on the data; `/metrics` is unauthenticated like the rest of the API |
+| `tasks_count` refreshed on an interval instead of per request | No table scan on the request path; the value reflects PostgreSQL rather than process memory | Eventually consistent up to one interval; stale but timestamped when PostgreSQL is unavailable, and absent before the first success |
+| Request correlation via `X-Request-ID` instead of OpenTelemetry | Cheap, dependency-free log correlation; every response carries the ID | It is not distributed tracing: no spans, sampling, propagation into PostgreSQL, or trace backend |
 | 70% coverage gate on the combined suite | The gate measures the PostgreSQL adapter as well as unit tests | It requires a live test database and a longer CI job |
 | Small, single-aggregate service | Easy to understand, test, and deploy | No authentication, pagination, filtering, sorting, search, timestamps, or multi-tenancy |
 
@@ -836,6 +992,11 @@ A few operational constraints are worth repeating:
 - The OpenAPI linter emits one advisory warning because the repository declares
   no license. The specification is still structurally valid.
 - The `coverage.out` profile is ignored by Git and is not a committed artifact.
+- `/metrics` reports aggregate values and route patterns, not task content, but
+  it has no authentication. Treat it like the rest of the API and restrict it
+  at the network edge. It is not part of the OpenAPI document.
+- `tasks_count` is not a transactional inventory. Do not use it for billing or
+  exact reconciliation; query PostgreSQL when exact state is required.
 
 ## 11. Troubleshooting
 
@@ -852,6 +1013,10 @@ A few operational constraints are worth repeating:
 | Tasks disappear after `docker compose down` | The volume was removed with `-v` | Use `docker compose down` without `-v`; `down -v` is intentionally destructive |
 | Requests return `500` after PostgreSQL restarts | The process is still running but the database is unavailable | Check database health and logs; restart the service once PostgreSQL is ready |
 | Swagger UI returns `404` | The path is not under `/swagger/`, or the binary is old | Use `/swagger/` or `/swagger/index.html`; rebuild the binary if the docs route is absent |
+| `/metrics` returns `404` | The binary predates the observability phase, or a test server was built without instrumentation | Rebuild/restart the service; `internal/app` always wires the endpoint |
+| `tasks_count` is missing from `/metrics` | No refresh has succeeded yet (database down, schema missing, or first refresh still running) | Check `/health`, the application log for `task count refresh failed`, and the refresh interval |
+| `tasks_count` looks stale | PostgreSQL became unavailable, or the refresh interval is large | Compare `time()` with `tasks_count_last_refresh_timestamp_seconds`; check database connectivity and `METRICS_TASKS_REFRESH_INTERVAL` |
+| Every response has an unexpected `X-Request-ID` | A proxy supplied an invalid or oversized header, so the service replaced it | Expected; the response header always contains the final identifier, which also appears in the request log |
 | Redocly reports a missing `license` warning | The repository does not declare a license | This is advisory; validation still succeeds. Do not add a false license just to silence it |
 
 ## 12. Project Structure
@@ -871,7 +1036,8 @@ A few operational constraints are worth repeating:
 │   │   ├── config/                 environment variables and defaults
 │   │   ├── database/               PostgreSQL pool, migrations, schema checks
 │   │   ├── handler/                shared HTTP error envelope
-│   │   ├── server/                 Gin router, middleware, health, 404/405
+│   │   ├── metrics/                Prometheus registry, collectors, task-count refresher
+│   │   ├── server/                 Gin router, middleware, request IDs, health, /metrics, 404/405
 │   │   └── swagger/                embedded spec and Swagger UI adapter
 │   └── task/
 │       ├── domain/                 Task aggregate, statuses, validation, UUIDs
@@ -909,6 +1075,7 @@ as the practical guide for setup, operation, and the current API.
 | [0007. CI runs the suite against a real PostgreSQL service and refuses silent skips](decisions/0007-ci-with-postgresql-service.md) | Provision ephemeral PostgreSQL in CI and assert that database tests actually ran. | Accepted (coverage gate and image checks added by 0008) |
 | [0008. Containerized local environment and a 70% coverage gate on the combined suite](decisions/0008-containers-and-coverage-gate.md) | Ship a multi-stage image, model migrations as a Compose service, and enforce 70% coverage on the combined suite. | Accepted |
 | [0009. A checked-in OpenAPI document as the HTTP contract](decisions/0009-openapi-contract.md) | Make [`api/openapi.yaml`](api/openapi.yaml) the canonical contract and serve it with embedded Swagger UI; no code generation. | Accepted |
+| [0010. Prometheus metrics and request correlation for HTTP observability](decisions/0010-prometheus-metrics-and-request-correlation.md) | Expose bounded request metrics, an eventually consistent PostgreSQL-backed task gauge, and `X-Request-ID` correlation from a dedicated registry; no OpenTelemetry. | Accepted |
 
 No record is superseded or deprecated. ADRs 0003, 0004, and 0007 carry amendment
 notes because later records refine part of their decision; read the amending ADR

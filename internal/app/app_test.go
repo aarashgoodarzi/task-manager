@@ -140,4 +140,10 @@ func TestInitializeWiresPostgreSQL(t *testing.T) {
 	if a.log == nil {
 		t.Fatal("logger is nil")
 	}
+	if a.metrics == nil {
+		t.Fatal("metrics is nil, want an initialized registry")
+	}
+	if a.taskCount == nil {
+		t.Fatal("task count refresher is nil, want it wired to the task repository")
+	}
 }

@@ -15,6 +15,7 @@ type Config struct {
 	Server   ServerConfig
 	Database DatabaseConfig
 	Logger   LoggerConfig
+	Metrics  MetricsConfig
 }
 
 // ServerConfig drives the HTTP server listener and timeouts.
@@ -39,10 +40,29 @@ type LoggerConfig struct {
 	Level string
 }
 
+// MetricsConfig drives the Prometheus instrumentation refresh loop.
+type MetricsConfig struct {
+	// TasksRefreshInterval is how often tasks_count is re-read from
+	// PostgreSQL. It bounds how stale the gauge can be; it is never read per
+	// request.
+	TasksRefreshInterval time.Duration
+}
+
+// defaultTasksRefreshInterval paces the tasks_count refresh. It is short
+// enough that a dashboard is useful and long enough that a full-table count is
+// negligible for this service.
+const defaultTasksRefreshInterval = 15 * time.Second
+
 // Load reads environment variables and applies defaults for anything unset.
 // It performs no validation that requires other packages (e.g. it does not
 // dial the database); callers decide how to react to empty required values.
 func Load() Config {
+	tasksRefreshInterval := envDuration("METRICS_TASKS_REFRESH_INTERVAL", defaultTasksRefreshInterval)
+	if tasksRefreshInterval <= 0 {
+		// A non-positive interval would make the refresher's ticker panic.
+		tasksRefreshInterval = defaultTasksRefreshInterval
+	}
+
 	return Config{
 		Server: ServerConfig{
 			Addr:              ":" + env("PORT", "8080"),
@@ -59,6 +79,9 @@ func Load() Config {
 		},
 		Logger: LoggerConfig{
 			Level: env("LOG_LEVEL", "info"),
+		},
+		Metrics: MetricsConfig{
+			TasksRefreshInterval: tasksRefreshInterval,
 		},
 	}
 }
