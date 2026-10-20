@@ -18,6 +18,7 @@ file and the older record is marked `Superseded by NNNN`.
 | [0006](0006-postgres-task-persistence.md) | Task persistence in PostgreSQL: table, versioned migrations, explicit-SQL repository | Accepted | `internal/infra/database/`, `internal/task/repository/postgres/`, `cmd/migrate/` |
 | [0007](0007-ci-with-postgresql-service.md) | CI runs the suite against a real PostgreSQL service and refuses silent skips | Accepted (coverage gate and image checks added by 0008) | `.github/workflows/ci.yml`, `Makefile`, README testing docs |
 | [0008](0008-containers-and-coverage-gate.md) | Containerized local environment and a 70% coverage gate on the combined suite | Accepted | `Dockerfile`, `.dockerignore`, `compose.yaml`, `Makefile`, CI, README |
+| [0009](0009-openapi-contract.md) | A checked-in OpenAPI document as the HTTP contract | Accepted | `api/` |
 
 ## When to write one
 
