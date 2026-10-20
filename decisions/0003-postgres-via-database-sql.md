@@ -105,3 +105,17 @@ Two implementation details are part of the decision:
   `database.New`.
 - `/health` depends on `PingContext` only; it does not assume any schema
   exists.
+
+## Amendment
+
+[ADR 0006](0006-postgres-task-persistence.md) decides the migration strategy
+this record deferred. The driver, ORM, and port decisions above are unchanged:
+
+- The schema is versioned SQL embedded in the binary and applied by
+  `cmd/migrate` (`make migrate`), one statement per file, recorded in
+  `schema_migrations`.
+- The application process still does not migrate at startup, which preserves
+  this record's rejection of auto-migration; starting the service never alters
+  the schema.
+- Task SQL lives in `internal/task/repository/postgres`, over `database/sql`
+  with explicit parameters, exactly as required here.

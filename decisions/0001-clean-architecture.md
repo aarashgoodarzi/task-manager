@@ -48,10 +48,11 @@ the service actually has:
    declares. No other package assembles config, database, and server.
 4. **Business rules live in the core.** For the task feature this means:
    `internal/task/domain` (types and invariants), `internal/task/service`
-   (use cases plus the repository port the use cases call),
+   (the repository port the use cases will call),
    `internal/task/handler` (HTTP mapping), and `internal/task/repository`
-   (explicit SQL). These packages do not exist yet; the rule applies to every
-   package added later.
+   (explicit SQL). Since ADR 0006 the persistence side exists as `domain`,
+   `service.Repository`, and `internal/task/repository/postgres`; the HTTP side
+   is added later. The rule applies to every package added later.
 
 The dependency rule, stated as a testable constraint: no package that contains
 domain or application logic may import Gin, `net/http`, `database/sql`, or
