@@ -1,8 +1,10 @@
-# Local development environment: PostgreSQL, an explicit migration step, and the
-# API. Credentials are local-development placeholders only; override them with
-# an untracked .env file or shell variables if needed.
+# Local development environment: PostgreSQL, Redis, an explicit migration step,
+# and the API. PostgreSQL is the source of truth; Redis only caches the task
+# list and is intentionally disposable. Credentials are local-development
+# placeholders only; override them with an untracked .env file or shell
+# variables if needed.
 #
-#   docker compose up -d --build   # start PostgreSQL, migrate, run the API
+#   docker compose up -d --build   # start PostgreSQL, Redis, migrate, run the API
 #   docker compose logs -f app
 #   docker compose down            # stop, keep the database volume
 #   docker compose down -v         # stop and DELETE the database volume
@@ -23,6 +25,22 @@ services:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # Cache only: no RDB/AOF persistence and no volume. Redis holds no data the
+  # service cannot rebuild from PostgreSQL. The loopback binding is for host
+  # integration tests and redis-cli; it is not reachable off the machine.
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 20
       start_period: 5s
     restart: unless-stopped
@@ -49,12 +67,20 @@ services:
     image: task-manager:local
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-task_manager}:${POSTGRES_PASSWORD:-task_manager}@postgres:5432/${POSTGRES_DB:-task_manager}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      REDIS_CACHE_TTL: ${REDIS_CACHE_TTL:-60s}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "${APP_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
+      # Started, not gated on health: the API is fail-open, so a Redis outage
+      # must never keep it from serving PostgreSQL-backed requests. Caching
+      # begins as soon as Redis answers, including via the adapter's recovery
+      # probe after a failed invalidation.
+      redis:
+        condition: service_started
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped

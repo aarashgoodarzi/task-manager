@@ -14,6 +14,7 @@ import (
 type Config struct {
 	Server   ServerConfig
 	Database DatabaseConfig
+	Redis    RedisConfig
 	Logger   LoggerConfig
 	Metrics  MetricsConfig
 }
@@ -40,6 +41,21 @@ type LoggerConfig struct {
 	Level string
 }
 
+// RedisConfig drives the optional task-list cache. An empty URL disables the
+// cache; the service keeps serving from PostgreSQL.
+type RedisConfig struct {
+	// URL is a go-redis connection URL. Empty disables caching.
+	URL string
+	// ListTTL bounds how long a cached task list may be served. It is finite
+	// so a missed invalidation cannot persist indefinitely.
+	ListTTL time.Duration
+}
+
+// defaultRedisListTTL is deliberately short relative to the task mutation
+// rate: it bounds staleness if a process dies between a committed write and
+// invalidation. The generation token handles the normal case immediately.
+const defaultRedisListTTL = 60 * time.Second
+
 // MetricsConfig drives the Prometheus instrumentation refresh loop.
 type MetricsConfig struct {
 	// TasksRefreshInterval is how often tasks_count is re-read from
@@ -63,6 +79,13 @@ func Load() Config {
 		tasksRefreshInterval = defaultTasksRefreshInterval
 	}
 
+	listTTL := envDuration("REDIS_CACHE_TTL", defaultRedisListTTL)
+	if listTTL <= 0 {
+		// A non-positive TTL would either disable expiry or be rejected by
+		// the adapter; keep the finite default.
+		listTTL = defaultRedisListTTL
+	}
+
 	return Config{
 		Server: ServerConfig{
 			Addr:              ":" + env("PORT", "8080"),
@@ -76,6 +99,10 @@ func Load() Config {
 			MaxOpenConns:    envInt("DATABASE_MAX_OPEN_CONNS", 10),
 			MaxIdleConns:    envInt("DATABASE_MAX_IDLE_CONNS", 5),
 			ConnMaxLifetime: envDuration("DATABASE_CONN_MAX_LIFETIME", 30*time.Minute),
+		},
+		Redis: RedisConfig{
+			URL:     env("REDIS_URL", ""),
+			ListTTL: listTTL,
 		},
 		Logger: LoggerConfig{
 			Level: env("LOG_LEVEL", "info"),

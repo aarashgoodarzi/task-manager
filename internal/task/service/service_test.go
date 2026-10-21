@@ -22,11 +22,18 @@ type fakeRepo struct {
 	deleteErr error
 
 	createCalls int
+	listCalls   int
 	updateCalls int
 }
 
 func newFakeRepo() *fakeRepo {
 	return &fakeRepo{tasks: make(map[string]domain.Task)}
+}
+
+// newService returns a service without a cache; cache behavior has dedicated
+// tests below.
+func newService(repo Repository) *Service {
+	return New(repo, nil, nil)
 }
 
 func (f *fakeRepo) Create(_ context.Context, task domain.Task) (domain.Task, error) {
@@ -41,6 +48,7 @@ func (f *fakeRepo) Create(_ context.Context, task domain.Task) (domain.Task, err
 }
 
 func (f *fakeRepo) List(_ context.Context) ([]domain.Task, error) {
+	f.listCalls++
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -87,7 +95,7 @@ func (f *fakeRepo) Delete(_ context.Context, id string) error {
 
 func TestCreateAppliesDefaultsAndTrimsTitle(t *testing.T) {
 	repo := newFakeRepo()
-	svc := New(repo)
+	svc := newService(repo)
 
 	task, err := svc.Create(context.Background(), Input{
 		Title:       "  write documentation  ",
@@ -115,7 +123,7 @@ func TestCreateAppliesDefaultsAndTrimsTitle(t *testing.T) {
 }
 
 func TestCreateAcceptsExplicitStatus(t *testing.T) {
-	svc := New(newFakeRepo())
+	svc := newService(newFakeRepo())
 
 	task, err := svc.Create(context.Background(), Input{Title: "ship it", Status: "done"})
 	if err != nil {
@@ -140,7 +148,7 @@ func TestCreateRejectsInvalidInputBeforeRepository(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := newFakeRepo()
-			_, err := New(repo).Create(context.Background(), tc.input)
+			_, err := newService(repo).Create(context.Background(), tc.input)
 
 			var verr *domain.ValidationError
 			if !errors.As(err, &verr) {
@@ -160,14 +168,14 @@ func TestCreatePropagatesRepositoryError(t *testing.T) {
 	repo := newFakeRepo()
 	repo.createErr = errors.New("storage exploded")
 
-	_, err := New(repo).Create(context.Background(), Input{Title: "task"})
+	_, err := newService(repo).Create(context.Background(), Input{Title: "task"})
 	if !errors.Is(err, repo.createErr) {
 		t.Fatalf("Create() error = %v, want wrapped repository error", err)
 	}
 }
 
 func TestListEmpty(t *testing.T) {
-	tasks, err := New(newFakeRepo()).List(context.Background())
+	tasks, err := newService(newFakeRepo()).List(context.Background())
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
@@ -181,7 +189,7 @@ func TestListPopulated(t *testing.T) {
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "first", Status: domain.StatusTodo}
 	repo.tasks["id-2"] = domain.Task{ID: "id-2", Title: "second", Status: domain.StatusDone}
 
-	tasks, err := New(repo).List(context.Background())
+	tasks, err := newService(repo).List(context.Background())
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
@@ -194,7 +202,7 @@ func TestListPropagatesRepositoryError(t *testing.T) {
 	repo := newFakeRepo()
 	repo.listErr = errors.New("storage exploded")
 
-	_, err := New(repo).List(context.Background())
+	_, err := newService(repo).List(context.Background())
 	if !errors.Is(err, repo.listErr) {
 		t.Fatalf("List() error = %v, want wrapped repository error", err)
 	}
@@ -204,7 +212,7 @@ func TestGetExisting(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "stored", Status: domain.StatusInProgress}
 
-	task, err := New(repo).Get(context.Background(), "id-1")
+	task, err := newService(repo).Get(context.Background(), "id-1")
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
@@ -214,7 +222,7 @@ func TestGetExisting(t *testing.T) {
 }
 
 func TestGetMissing(t *testing.T) {
-	_, err := New(newFakeRepo()).Get(context.Background(), "id-missing")
+	_, err := newService(newFakeRepo()).Get(context.Background(), "id-missing")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get() error = %v, want ErrNotFound", err)
 	}
@@ -224,7 +232,7 @@ func TestGetPropagatesRepositoryError(t *testing.T) {
 	repo := newFakeRepo()
 	repo.getErr = errors.New("storage exploded")
 
-	_, err := New(repo).Get(context.Background(), "id-1")
+	_, err := newService(repo).Get(context.Background(), "id-1")
 	if !errors.Is(err, repo.getErr) {
 		t.Fatalf("Get() error = %v, want wrapped repository error", err)
 	}
@@ -234,7 +242,7 @@ func TestUpdateReplacesExistingTask(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "old", Description: "old", Status: domain.StatusTodo}
 
-	updated, err := New(repo).Update(context.Background(), "id-1", Input{
+	updated, err := newService(repo).Update(context.Background(), "id-1", Input{
 		Title:       "  new title ",
 		Description: "new description",
 		Status:      "in_progress",
@@ -256,7 +264,7 @@ func TestUpdateWithoutStatusAppliesDefault(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "old", Status: domain.StatusDone}
 
-	updated, err := New(repo).Update(context.Background(), "id-1", Input{Title: "new"})
+	updated, err := newService(repo).Update(context.Background(), "id-1", Input{Title: "new"})
 	if err != nil {
 		t.Fatalf("Update() unexpected error: %v", err)
 	}
@@ -266,7 +274,7 @@ func TestUpdateWithoutStatusAppliesDefault(t *testing.T) {
 }
 
 func TestUpdateMissing(t *testing.T) {
-	_, err := New(newFakeRepo()).Update(context.Background(), "id-missing", Input{Title: "task"})
+	_, err := newService(newFakeRepo()).Update(context.Background(), "id-missing", Input{Title: "task"})
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Update() error = %v, want ErrNotFound", err)
 	}
@@ -276,7 +284,7 @@ func TestUpdateRejectsInvalidInputBeforeRepository(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "old", Status: domain.StatusTodo}
 
-	_, err := New(repo).Update(context.Background(), "id-1", Input{Title: " ", Status: "pending"})
+	_, err := newService(repo).Update(context.Background(), "id-1", Input{Title: " ", Status: "pending"})
 
 	var verr *domain.ValidationError
 	if !errors.As(err, &verr) {
@@ -292,7 +300,7 @@ func TestUpdatePropagatesRepositoryError(t *testing.T) {
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "old", Status: domain.StatusTodo}
 	repo.updateErr = errors.New("storage exploded")
 
-	_, err := New(repo).Update(context.Background(), "id-1", Input{Title: "new"})
+	_, err := newService(repo).Update(context.Background(), "id-1", Input{Title: "new"})
 	if !errors.Is(err, repo.updateErr) {
 		t.Fatalf("Update() error = %v, want wrapped repository error", err)
 	}
@@ -302,7 +310,7 @@ func TestDeleteExisting(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "task", Status: domain.StatusTodo}
 
-	if err := New(repo).Delete(context.Background(), "id-1"); err != nil {
+	if err := newService(repo).Delete(context.Background(), "id-1"); err != nil {
 		t.Fatalf("Delete() unexpected error: %v", err)
 	}
 	if _, ok := repo.tasks["id-1"]; ok {
@@ -311,7 +319,7 @@ func TestDeleteExisting(t *testing.T) {
 }
 
 func TestDeleteMissing(t *testing.T) {
-	err := New(newFakeRepo()).Delete(context.Background(), "id-missing")
+	err := newService(newFakeRepo()).Delete(context.Background(), "id-missing")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Delete() error = %v, want ErrNotFound", err)
 	}
@@ -321,8 +329,333 @@ func TestDeletePropagatesRepositoryError(t *testing.T) {
 	repo := newFakeRepo()
 	repo.deleteErr = errors.New("storage exploded")
 
-	err := New(repo).Delete(context.Background(), "id-1")
+	err := newService(repo).Delete(context.Background(), "id-1")
 	if !errors.Is(err, repo.deleteErr) {
 		t.Fatalf("Delete() error = %v, want wrapped repository error", err)
+	}
+}
+
+// fakeCache is a deterministic cache double. It records calls and the last
+// snapshot so tests can assert both the decision and the data written back.
+type fakeCache struct {
+	snapshot ListSnapshot
+
+	getErr        error
+	setErr        error
+	invalidateErr error
+
+	getCalls        int
+	setCalls        int
+	invalidateCalls int
+
+	lastSnapshot     ListSnapshot
+	invalidateCtxErr error
+}
+
+func (f *fakeCache) Get(context.Context) (ListSnapshot, error) {
+	f.getCalls++
+	if f.getErr != nil {
+		return ListSnapshot{}, f.getErr
+	}
+	return f.snapshot, nil
+}
+
+func (f *fakeCache) Set(_ context.Context, snapshot ListSnapshot) error {
+	f.setCalls++
+	f.lastSnapshot = snapshot
+	return f.setErr
+}
+
+func (f *fakeCache) Invalidate(ctx context.Context) error {
+	f.invalidateCalls++
+	f.invalidateCtxErr = ctx.Err()
+	return f.invalidateErr
+}
+
+func TestListCacheHitReturnsCachedTasksWithoutRepository(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["db-task"] = domain.Task{ID: "db-task", Title: "from database", Status: domain.StatusTodo}
+
+	cached := []domain.Task{{ID: "cached-task", Title: "from cache", Status: domain.StatusDone}}
+	cache := &fakeCache{snapshot: ListSnapshot{Tasks: cached, Token: "gen-1", Hit: true}}
+
+	tasks, err := New(repo, cache, nil).List(context.Background())
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "cached-task" {
+		t.Fatalf("tasks = %+v, want the cached list", tasks)
+	}
+	if repo.listCalls != 0 {
+		t.Fatalf("repository List called %d times, want 0 on a cache hit", repo.listCalls)
+	}
+	if cache.setCalls != 0 {
+		t.Fatalf("cache Set called %d times, want 0 on a hit", cache.setCalls)
+	}
+}
+
+func TestListCacheHitEmptyListIsAValidHit(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["db-task"] = domain.Task{ID: "db-task", Title: "not empty", Status: domain.StatusTodo}
+
+	cache := &fakeCache{snapshot: ListSnapshot{Tasks: []domain.Task{}, Token: "gen-1", Hit: true}}
+
+	tasks, err := New(repo, cache, nil).List(context.Background())
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if tasks == nil || len(tasks) != 0 {
+		t.Fatalf("tasks = %#v, want a non-nil empty list", tasks)
+	}
+	if repo.listCalls != 0 {
+		t.Fatalf("repository List called %d times, want 0 for an empty cached list", repo.listCalls)
+	}
+}
+
+func TestListCacheMissReadsRepositoryAndStoresResult(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "first", Status: domain.StatusTodo}
+	repo.tasks["id-2"] = domain.Task{ID: "id-2", Title: "second", Status: domain.StatusDone}
+
+	cache := &fakeCache{snapshot: ListSnapshot{Token: "gen-1"}}
+
+	tasks, err := New(repo, cache, nil).List(context.Background())
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("len(tasks) = %d, want 2", len(tasks))
+	}
+	if repo.listCalls != 1 {
+		t.Fatalf("repository List called %d times, want 1", repo.listCalls)
+	}
+	if cache.setCalls != 1 {
+		t.Fatalf("cache Set called %d times, want 1", cache.setCalls)
+	}
+	if cache.lastSnapshot.Token != "gen-1" {
+		t.Fatalf("stored token = %q, want the token returned by Get", cache.lastSnapshot.Token)
+	}
+	if len(cache.lastSnapshot.Tasks) != 2 {
+		t.Fatalf("stored tasks = %+v, want the database list", cache.lastSnapshot.Tasks)
+	}
+}
+
+func TestListCacheReadFailureFallsBackToRepository(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "stored", Status: domain.StatusTodo}
+
+	cache := &fakeCache{getErr: errors.New("redis unavailable")}
+
+	tasks, err := New(repo, cache, nil).List(context.Background())
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "id-1" {
+		t.Fatalf("tasks = %+v, want the database list", tasks)
+	}
+	if repo.listCalls != 1 {
+		t.Fatalf("repository List called %d times, want the fallback query", repo.listCalls)
+	}
+	if cache.setCalls != 0 {
+		t.Fatalf("cache Set called %d times after a read failure, want 0", cache.setCalls)
+	}
+}
+
+func TestListCacheWriteFailureStillReturnsDatabaseResult(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "stored", Status: domain.StatusTodo}
+
+	cache := &fakeCache{
+		snapshot: ListSnapshot{Token: "gen-1"},
+		setErr:   errors.New("redis unavailable"),
+	}
+
+	tasks, err := New(repo, cache, nil).List(context.Background())
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "id-1" {
+		t.Fatalf("tasks = %+v, want the database list", tasks)
+	}
+	if cache.setCalls != 1 {
+		t.Fatalf("cache Set called %d times, want 1", cache.setCalls)
+	}
+}
+
+func TestListRepositoryFailureIsNotCached(t *testing.T) {
+	repo := newFakeRepo()
+	repo.listErr = errors.New("storage exploded")
+
+	cache := &fakeCache{snapshot: ListSnapshot{Token: "gen-1"}}
+
+	_, err := New(repo, cache, nil).List(context.Background())
+	if !errors.Is(err, repo.listErr) {
+		t.Fatalf("List() error = %v, want wrapped repository error", err)
+	}
+	if cache.setCalls != 0 {
+		t.Fatalf("cache Set called %d times after a repository error, want 0", cache.setCalls)
+	}
+}
+
+func TestListMalformedCacheFallsBackToRepository(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "stored", Status: domain.StatusTodo}
+
+	cache := &fakeCache{getErr: errors.New("decode cached list: invalid character")}
+
+	tasks, err := New(repo, cache, nil).List(context.Background())
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "id-1" {
+		t.Fatalf("tasks = %+v, want the database list", tasks)
+	}
+	if repo.listCalls != 1 {
+		t.Fatalf("repository List called %d times, want the fallback query", repo.listCalls)
+	}
+}
+
+func TestCacheDisabledKeepsListWorking(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "stored", Status: domain.StatusTodo}
+
+	tasks, err := New(repo, nil, nil).List(context.Background())
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	}
+}
+
+func TestCreateInvalidatesListCache(t *testing.T) {
+	repo := newFakeRepo()
+	cache := &fakeCache{}
+
+	if _, err := New(repo, cache, nil).Create(context.Background(), Input{Title: "new"}); err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+	if cache.invalidateCalls != 1 {
+		t.Fatalf("cache Invalidate called %d times, want 1 after create", cache.invalidateCalls)
+	}
+}
+
+func TestUpdateInvalidatesListCache(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "old", Status: domain.StatusTodo}
+	cache := &fakeCache{}
+
+	if _, err := New(repo, cache, nil).Update(context.Background(), "id-1", Input{Title: "new"}); err != nil {
+		t.Fatalf("Update() unexpected error: %v", err)
+	}
+	if cache.invalidateCalls != 1 {
+		t.Fatalf("cache Invalidate called %d times, want 1 after update", cache.invalidateCalls)
+	}
+}
+
+func TestDeleteInvalidatesListCache(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "task", Status: domain.StatusTodo}
+	cache := &fakeCache{}
+
+	if err := New(repo, cache, nil).Delete(context.Background(), "id-1"); err != nil {
+		t.Fatalf("Delete() unexpected error: %v", err)
+	}
+	if cache.invalidateCalls != 1 {
+		t.Fatalf("cache Invalidate called %d times, want 1 after delete", cache.invalidateCalls)
+	}
+}
+
+func TestFailedCreateDoesNotInvalidateListCache(t *testing.T) {
+	repo := newFakeRepo()
+	repo.createErr = errors.New("storage exploded")
+	cache := &fakeCache{}
+
+	if _, err := New(repo, cache, nil).Create(context.Background(), Input{Title: "task"}); err == nil {
+		t.Fatal("Create() error = nil, want repository error")
+	}
+	if cache.invalidateCalls != 0 {
+		t.Fatalf("cache Invalidate called %d times, want 0 after a failed create", cache.invalidateCalls)
+	}
+}
+
+func TestFailedUpdateDoesNotInvalidateListCache(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "old", Status: domain.StatusTodo}
+	repo.updateErr = errors.New("storage exploded")
+	cache := &fakeCache{}
+
+	if _, err := New(repo, cache, nil).Update(context.Background(), "id-1", Input{Title: "new"}); err == nil {
+		t.Fatal("Update() error = nil, want repository error")
+	}
+	if cache.invalidateCalls != 0 {
+		t.Fatalf("cache Invalidate called %d times, want 0 after a failed update", cache.invalidateCalls)
+	}
+}
+
+func TestFailedDeleteDoesNotInvalidateListCache(t *testing.T) {
+	repo := newFakeRepo()
+	repo.deleteErr = errors.New("storage exploded")
+	cache := &fakeCache{}
+
+	if err := New(repo, cache, nil).Delete(context.Background(), "id-1"); err == nil {
+		t.Fatal("Delete() error = nil, want repository error")
+	}
+	if cache.invalidateCalls != 0 {
+		t.Fatalf("cache Invalidate called %d times, want 0 after a failed delete", cache.invalidateCalls)
+	}
+}
+
+func TestInvalidationFailureDoesNotFailCreate(t *testing.T) {
+	repo := newFakeRepo()
+	cache := &fakeCache{invalidateErr: errors.New("redis unavailable")}
+
+	created, err := New(repo, cache, nil).Create(context.Background(), Input{Title: "new"})
+	if err != nil {
+		t.Fatalf("Create() error = %v, want success despite cache failure", err)
+	}
+	if created.ID == "" {
+		t.Fatal("created task has no id")
+	}
+	if cache.invalidateCalls != 1 {
+		t.Fatalf("cache Invalidate called %d times, want 1", cache.invalidateCalls)
+	}
+}
+
+func TestInvalidationFailureDoesNotFailUpdate(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "old", Status: domain.StatusTodo}
+	cache := &fakeCache{invalidateErr: errors.New("redis unavailable")}
+
+	if _, err := New(repo, cache, nil).Update(context.Background(), "id-1", Input{Title: "new"}); err != nil {
+		t.Fatalf("Update() error = %v, want success despite cache failure", err)
+	}
+}
+
+func TestInvalidationFailureDoesNotFailDelete(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "task", Status: domain.StatusTodo}
+	cache := &fakeCache{invalidateErr: errors.New("redis unavailable")}
+
+	if err := New(repo, cache, nil).Delete(context.Background(), "id-1"); err != nil {
+		t.Fatalf("Delete() error = %v, want success despite cache failure", err)
+	}
+}
+
+func TestInvalidationSurvivesCanceledRequestContext(t *testing.T) {
+	repo := newFakeRepo()
+	cache := &fakeCache{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := New(repo, cache, nil).Create(ctx, Input{Title: "task"}); err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+	if cache.invalidateCalls != 1 {
+		t.Fatalf("cache Invalidate called %d times, want 1", cache.invalidateCalls)
+	}
+	if cache.invalidateCtxErr != nil {
+		t.Fatalf("invalidation context error = %v, want a context detached from request cancellation", cache.invalidateCtxErr)
 	}
 }

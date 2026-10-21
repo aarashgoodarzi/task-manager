@@ -117,6 +117,7 @@ func TestInitializeWiresPostgreSQL(t *testing.T) {
 
 	t.Setenv("DATABASE_URL", dsn)
 	t.Setenv("LOG_LEVEL", "error")
+	t.Setenv("REDIS_URL", "")
 
 	a := New()
 	if err := a.Initialize(); err != nil {
@@ -145,5 +146,8 @@ func TestInitializeWiresPostgreSQL(t *testing.T) {
 	}
 	if a.taskCount == nil {
 		t.Fatal("task count refresher is nil, want it wired to the task repository")
+	}
+	if a.cache != nil {
+		t.Fatal("cache is non-nil without REDIS_URL, want caching disabled")
 	}
 }

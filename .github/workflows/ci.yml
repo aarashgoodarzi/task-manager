@@ -1,8 +1,8 @@
 name: CI
 
-# The integration suite is gated by TEST_DATABASE_URL, so it only proves
-# anything when a real PostgreSQL server is present. This workflow provides one
-# and then asserts that the database-backed tests actually executed.
+# The integration suite is gated by TEST_DATABASE_URL and TEST_REDIS_URL, so it
+# only proves anything when real PostgreSQL and Redis servers are present. This
+# workflow provides both and then asserts that the adapter tests executed.
 on:
   push:
     branches: [main]
@@ -38,6 +38,17 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      redis:
+        # Ephemeral cache only; persistence is disabled so every run starts
+        # empty and cannot leak state into the next run.
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
 
     env:
       # Test-only credentials for the ephemeral service container above. They
@@ -46,6 +57,9 @@ jobs:
       # DATABASE_URL is deliberately absent: the configuration tests assert the
       # unset defaults, and only the migration step exports it.
       TEST_DATABASE_URL: postgres://task_manager:task_manager@localhost:5432/task_manager_test?sslmode=disable
+      # Dedicated logical database and unique key prefixes keep cache tests
+      # isolated from any other data on the service container.
+      TEST_REDIS_URL: redis://localhost:6379/15
 
     steps:
       - name: Check out the repository
@@ -75,11 +89,12 @@ jobs:
       - name: Build
         run: go build ./...
 
-      # The database-free tier: TEST_DATABASE_URL is cleared so the integration
-      # tests skip exactly as they do on a machine without PostgreSQL.
-      - name: Unit tests (database-free)
+      # The infrastructure-free tier: both integration variables are cleared so
+      # the adapter tests skip exactly as they do on a machine without them.
+      - name: Unit tests (infrastructure-free)
         env:
           TEST_DATABASE_URL: ""
+          TEST_REDIS_URL: ""
         run: go test -count=1 ./...
 
       - name: Apply migrations
@@ -87,9 +102,9 @@ jobs:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
         run: go run ./cmd/migrate
 
-      # make test-integration refuses to run without TEST_DATABASE_URL, so a
-      # missing variable fails here instead of producing a green, empty run.
-      - name: PostgreSQL integration tests
+      # make test-integration refuses to run without both variables, so a
+      # missing one fails here instead of producing a green, empty run.
+      - name: Integration tests (PostgreSQL and Redis)
         run: make test-integration
 
       # A skip would still exit 0, so prove that the database-backed tests ran
@@ -105,14 +120,27 @@ jobs:
             exit 1
           fi
 
-      # Packages share one database, so they run sequentially (-p 1) to keep
-      # schema and table state from interleaving across packages.
-      - name: Race detector against PostgreSQL
+      # Redis tests skip without TEST_REDIS_URL, which would still exit 0. Prove
+      # the real-Redis tests ran and that none of them skipped.
+      - name: Assert Redis tests ran
+        run: |
+          out=$(go test -count=1 -v -run 'TestRedisCache' ./internal/task/cache/redis)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q -- '--- PASS: TestRedisCacheMissThenHit'
+          printf '%s\n' "$out" | grep -q -- '--- PASS: TestRedisCacheStaleRefillRace'
+          if printf '%s\n' "$out" | grep -q -- '--- SKIP'; then
+            echo "Redis integration tests were skipped despite TEST_REDIS_URL being set" >&2
+            exit 1
+          fi
+
+      # Packages share one database and Redis instance, so they run sequentially
+      # (-p 1) to keep schema, table, and key state from interleaving.
+      - name: Race detector against PostgreSQL and Redis
         run: go test -race -count=1 -p 1 ./...
 
       # The gate measures the combined unit + integration suite, because the
-      # PostgreSQL adapter is only executed when TEST_DATABASE_URL is set. The
-      # threshold itself lives in the Makefile, not in this workflow.
+      # PostgreSQL and Redis adapters only execute when their test URLs are set.
+      # The threshold itself lives in the Makefile, not in this workflow.
       - name: Coverage gate
         run: make coverage-check
 

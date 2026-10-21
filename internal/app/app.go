@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -18,7 +19,9 @@ import (
 	"github.com/aarashgoodarzi/task-manager/internal/infra/database"
 	infraMetrics "github.com/aarashgoodarzi/task-manager/internal/infra/metrics"
 	"github.com/aarashgoodarzi/task-manager/internal/infra/server"
+	taskRedis "github.com/aarashgoodarzi/task-manager/internal/task/cache/redis"
 	"github.com/aarashgoodarzi/task-manager/internal/task/repository/postgres"
+	"github.com/aarashgoodarzi/task-manager/internal/task/service"
 )
 
 // databaseStartupTimeout bounds the connectivity and schema checks performed
@@ -26,15 +29,21 @@ import (
 // the boot path.
 const databaseStartupTimeout = 5 * time.Second
 
+// cacheStartupTimeout bounds the best-effort generation reset performed when a
+// Redis cache is configured. Redis is optional, so this never fails startup.
+const cacheStartupTimeout = 2 * time.Second
+
 // App holds every top-level dependency created during Initialize.
 type App struct {
-	cfg       config.Config
-	log       *slog.Logger
-	db        *sql.DB
-	health    server.HealthChecker
-	metrics   *infraMetrics.Metrics
-	taskCount *infraMetrics.TaskCountRefresher
-	server    *server.Server
+	cfg         config.Config
+	log         *slog.Logger
+	db          *sql.DB
+	health      server.HealthChecker
+	metrics     *infraMetrics.Metrics
+	taskCount   *infraMetrics.TaskCountRefresher
+	cache       service.ListCache
+	cacheCloser io.Closer
+	server      *server.Server
 }
 
 // New returns an unwired App. Call Initialize before Start.
@@ -89,6 +98,33 @@ func (a *App) Initialize() error {
 	// refresher; both consume it through the narrow ports they declare.
 	taskRepo := postgres.New(a.db)
 
+	// Redis is an optional accelerator, never the source of truth. Constructing
+	// the adapter does not dial, so a missing or unreachable server leaves the
+	// cache disabled instead of stopping the API. The startup invalidation
+	// closes the restart window: a process that died after a committed write
+	// cannot leave an old generation readable, and a failure here is logged but
+	// non-fatal (the adapter degrades to database reads).
+	if a.cfg.Redis.URL != "" {
+		cache, cacheErr := taskRedis.New(taskRedis.Config{
+			URL: a.cfg.Redis.URL,
+			TTL: a.cfg.Redis.ListTTL,
+		})
+		if cacheErr != nil {
+			a.log.Warn("redis cache disabled", slog.Any("error", cacheErr))
+		} else {
+			a.cache = cache
+			a.cacheCloser = cache
+
+			cacheCtx, cancelCache := context.WithTimeout(context.Background(), cacheStartupTimeout)
+			if err := cache.Invalidate(cacheCtx); err != nil {
+				a.log.Warn("redis cache unavailable at startup; serving from PostgreSQL", slog.Any("error", err))
+			} else {
+				a.log.Info("redis cache enabled", slog.Duration("list_ttl", a.cfg.Redis.ListTTL))
+			}
+			cancelCache()
+		}
+	}
+
 	// Instrumentation owns its own registry, so it can be constructed per App
 	// (including in tests) without touching the global Prometheus registry.
 	a.metrics = infraMetrics.New()
@@ -137,6 +173,14 @@ func (a *App) Start() error {
 	stopRefresher()
 	if a.taskCount != nil {
 		<-refresherDone
+	}
+
+	// The cache has no background work; closing it before the pool keeps the
+	// shutdown order easy to reason about without changing the database rule.
+	if a.cacheCloser != nil {
+		if closeErr := a.cacheCloser.Close(); closeErr != nil {
+			a.log.Error("error closing redis cache", slog.Any("error", closeErr))
+		}
 	}
 
 	if a.db != nil {

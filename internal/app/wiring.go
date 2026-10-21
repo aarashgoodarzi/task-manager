@@ -16,7 +16,7 @@ import (
 // feature is added.
 func (a *App) buildHandlers(tasks service.Repository) []server.RouteRegistrar {
 	return []server.RouteRegistrar{
-		handler.New(service.New(tasks), a.log),
+		handler.New(service.New(tasks, a.cache, a.log), a.log),
 		swagger.New(),
 	}
 }

@@ -107,7 +107,7 @@ func (r *stubRepository) Delete(_ context.Context, id string) error {
 
 // newTaskRouter wires the real handler and service with the repository double.
 func newTaskRouter() *gin.Engine {
-	return newTestRouter(service.New(newStubRepository()))
+	return newTestRouter(service.New(newStubRepository(), nil, discardLogger()))
 }
 
 func doRequest(r http.Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -207,7 +207,7 @@ func TestCreateTaskWithExplicitStatus(t *testing.T) {
 func TestPostToCollectionDoesNotCreateTask(t *testing.T) {
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
-	New(service.New(newStubRepository()), discardLogger()).RegisterRoutes(router)
+	New(service.New(newStubRepository(), nil, discardLogger()), discardLogger()).RegisterRoutes(router)
 
 	rec := doRequest(router, http.MethodPost, "/tasks", `{"title":"must not be created"}`)
 	if rec.Code != http.StatusMethodNotAllowed {

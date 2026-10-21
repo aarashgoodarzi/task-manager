@@ -21,6 +21,8 @@ func clearConfigEnv(t *testing.T) {
 		"DATABASE_MAX_OPEN_CONNS",
 		"DATABASE_MAX_IDLE_CONNS",
 		"DATABASE_CONN_MAX_LIFETIME",
+		"REDIS_URL",
+		"REDIS_CACHE_TTL",
 		"LOG_LEVEL",
 		"METRICS_TASKS_REFRESH_INTERVAL",
 	} {
@@ -42,6 +44,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Database.MaxOpenConns != 10 {
 		t.Fatalf("Database.MaxOpenConns = %d, want 10", cfg.Database.MaxOpenConns)
 	}
+	if cfg.Redis.URL != "" {
+		t.Fatalf("Redis.URL = %q, want empty default (cache disabled)", cfg.Redis.URL)
+	}
+	if cfg.Redis.ListTTL != 60*time.Second {
+		t.Fatalf("Redis.ListTTL = %v, want 60s", cfg.Redis.ListTTL)
+	}
 	if cfg.Logger.Level != "info" {
 		t.Fatalf("Logger.Level = %q, want %q", cfg.Logger.Level, "info")
 	}
@@ -59,6 +67,8 @@ func TestLoadReadsEnvOverrides(t *testing.T) {
 	t.Setenv("SERVER_READ_TIMEOUT", "2s")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("METRICS_TASKS_REFRESH_INTERVAL", "30s")
+	t.Setenv("REDIS_URL", "redis://localhost:6379/3")
+	t.Setenv("REDIS_CACHE_TTL", "2m")
 
 	cfg := Load()
 
@@ -73,6 +83,12 @@ func TestLoadReadsEnvOverrides(t *testing.T) {
 	}
 	if cfg.Server.ReadTimeout != 2*time.Second {
 		t.Fatalf("Server.ReadTimeout = %v, want 2s", cfg.Server.ReadTimeout)
+	}
+	if cfg.Redis.URL != "redis://localhost:6379/3" {
+		t.Fatalf("Redis.URL = %q", cfg.Redis.URL)
+	}
+	if cfg.Redis.ListTTL != 2*time.Minute {
+		t.Fatalf("Redis.ListTTL = %v, want 2m", cfg.Redis.ListTTL)
 	}
 	if cfg.Logger.Level != "debug" {
 		t.Fatalf("Logger.Level = %q, want %q", cfg.Logger.Level, "debug")
@@ -91,6 +107,23 @@ func TestLoadIgnoresInvalidIntOverride(t *testing.T) {
 
 	if cfg.Database.MaxOpenConns != 10 {
 		t.Fatalf("Database.MaxOpenConns = %d, want fallback 10", cfg.Database.MaxOpenConns)
+	}
+}
+
+// TestLoadRejectsNonPositiveCacheTTL keeps a finite expiry in place; the
+// adapter rejects a non-positive TTL and caching would silently disable.
+func TestLoadRejectsNonPositiveCacheTTL(t *testing.T) {
+	for _, value := range []string{"0s", "-5s", "not-a-duration"} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("REDIS_CACHE_TTL", value)
+
+			cfg := Load()
+
+			if cfg.Redis.ListTTL != 60*time.Second {
+				t.Fatalf("Redis.ListTTL = %v, want the 60s fallback", cfg.Redis.ListTTL)
+			}
+		})
 	}
 }
 

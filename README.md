@@ -34,11 +34,12 @@ structured request log. A multi-stage Docker image and a
 | Task domain model, statuses, validation, and UUID identifiers | Implemented |
 | Task service use cases behind a repository interface | Implemented |
 | PostgreSQL task repository using explicit SQL | Implemented |
+| Redis cache-aside for `GET /tasks` with generation-token invalidation | Implemented |
 | CRUD endpoints: `POST /task` and `GET/PUT/DELETE /tasks` | Implemented |
 | Uniform JSON error envelope and `404` / `405` handling | Implemented |
 | OpenAPI 3.0.3 contract and embedded Swagger UI | Implemented |
-| Unit, service, HTTP, PostgreSQL integration, and docs tests | Implemented |
-| GitHub Actions CI with PostgreSQL, coverage gate, and image build | Implemented |
+| Unit, service, HTTP, PostgreSQL integration, Redis integration, and docs tests | Implemented |
+| GitHub Actions CI with PostgreSQL, Redis, coverage gate, and image build | Implemented |
 | Multi-stage Docker image and Docker Compose environment | Implemented |
 | Authentication, authorization, and multi-tenancy | Not implemented |
 | Filtering, pagination, sorting controls, and search | Not implemented |
@@ -54,6 +55,7 @@ structured request log. A multi-stage Docker image and a
 | HTTP | [Gin](https://github.com/gin-gonic/gin) v1.12.0 |
 | Database access | `database/sql` with the [pgx](https://github.com/jackc/pgx) v5 stdlib driver |
 | Database | PostgreSQL; Compose pins `postgres:16.4-alpine` |
+| Cache | [Redis](https://redis.io/) via [go-redis](https://github.com/redis/go-redis) v9.23.0; Compose pins `redis:7.4-alpine` |
 | Migrations | Embedded `NNNN_description.sql` files applied by `cmd/migrate` |
 | API documentation | OpenAPI 3.0.3 at [`api/openapi.yaml`](api/openapi.yaml); embedded [Swagger UI](https://swagger.io/tools/swagger-ui/) via `swaggest/swgui` |
 | Containers | Multi-stage [`Dockerfile`](Dockerfile) (Alpine runtime, non-root) and [`compose.yaml`](compose.yaml) |
@@ -63,6 +65,8 @@ structured request log. A multi-stage Docker image and a
 | Configuration | Standard-library `os.Getenv`, read once at startup |
 
 No ORM, external migration tool, or hosted documentation service is required.
+Redis is an optional cache, not a second source of truth: without `REDIS_URL`
+the service runs database-only, and a Redis outage falls back to PostgreSQL.
 
 ### Scope and limitations
 
@@ -73,6 +77,11 @@ sorting, search, or transition rules for status values.
 
 The service is intended to run against PostgreSQL. It has no volatile storage
 mode, no automatic database provisioning, and no migration-at-startup behavior.
+Redis caches only the `GET /tasks` list; task writes always commit to
+PostgreSQL first. Cache entries expire after a finite TTL, and a mutation
+advances a generation token so a slow reader cannot republish a pre-mutation
+list. The consistency limits are documented in
+[ADR 0013](decisions/0013-redis-cache-aside-for-task-list.md).
 Production concerns such as authentication, authorization, rate limiting,
 metrics storage and dashboards, distributed tracing, and horizontal
 coordination are outside the current scope. The metrics endpoint is
@@ -84,9 +93,10 @@ aggregate, or alert on them.
 Choose one of the two setup paths:
 
 - **Docker path:** Docker Engine with Docker Compose v2. Compose supplies
-  PostgreSQL, runs migrations, and starts the API.
+  PostgreSQL and Redis, runs migrations, and starts the API.
 - **Local path:** Go and a PostgreSQL server, plus `make` if you want to use the
-  Makefile targets.
+  Makefile targets. Redis is optional for the process; without it the API
+  serves from PostgreSQL and the cache is disabled.
 
 Tool requirements:
 
@@ -94,6 +104,7 @@ Tool requirements:
 | --- | --- | --- |
 | Go | 1.26.2 or a compatible newer toolchain; `go.mod` declares `go 1.26.2` | Building and running locally |
 | PostgreSQL | A reachable server; the repository is verified locally against 14.13 and Compose pins 16.4 | Runtime, migrations, integration tests |
+| Redis | Optional at runtime; required for the Redis integration suite; Compose pins 7.4 | Task-list cache and cache tests |
 | `make` | Optional | Makefile wrappers; every target has a direct `go` equivalent |
 | Docker + Compose v2 | Optional | Image and local Compose environment |
 | `curl` | Optional | The verification commands below |
@@ -115,8 +126,9 @@ tests; its name must contain `test` because the repository tests truncate the
 ### Option A: Docker Compose
 
 This path needs no local Go toolchain, database, or manual migration. Compose
-starts PostgreSQL, waits for its health check, runs the one-shot `migrate`
-service, and only then starts `app`:
+starts PostgreSQL and Redis, waits for PostgreSQL to become healthy, runs the
+one-shot `migrate` service, and only then starts `app`. Redis only has to be
+started: the API is fail-open, so an unhealthy Redis never blocks startup.
 
 ```bash
 docker compose up -d --build
@@ -134,7 +146,10 @@ curl -s http://localhost:8080/health
 # {"database":"ok","status":"ok"}
 
 curl -s http://localhost:8080/tasks
-# [] on a fresh database
+# [] on a fresh database; this GET creates the cache entry
+
+docker compose exec redis redis-cli --scan --pattern 'task-manager:tasks:list:*'
+# task-manager:tasks:list:generation and one task-manager:tasks:list:<token>
 
 curl -s http://localhost:8080/metrics | head
 # Prometheus text exposition: requests_total, request_latency_histogram, ...
@@ -186,6 +201,12 @@ go mod download
 export DATABASE_URL='postgres:///task_manager?host=localhost&sslmode=disable'
 export TEST_DATABASE_URL='postgres:///task_manager_test?host=localhost&sslmode=disable'
 
+# Optional: start only Redis from Compose and point the process at it.
+# Without REDIS_URL the service runs normally with caching disabled.
+docker compose up -d redis
+export REDIS_URL='redis://localhost:6379/0'
+export TEST_REDIS_URL='redis://localhost:6379/15'
+
 make migrate
 make run
 ```
@@ -204,9 +225,11 @@ migrate: schema is up to date
 ```
 
 A successful start logs the initialization and listening messages and keeps
-running in the foreground:
+running in the foreground. With Redis configured, it also logs that the cache
+is enabled:
 
 ```text
+level=INFO msg="redis cache enabled" list_ttl=1m0s
 level=INFO msg="task-manager initialized" addr=:8080
 level=INFO msg="server listening" addr=:8080
 ```
@@ -232,7 +255,8 @@ make build
 
 `make build` writes the ignored `task-manager` binary in the repository root.
 Press `Ctrl+C` or send `SIGTERM` to stop either form; the server drains requests
-for up to 10 seconds and closes the database pool.
+for up to 10 seconds, closes the Redis client if configured, and then closes the
+database pool.
 
 ## 4. Configuration
 
@@ -254,9 +278,12 @@ loaded in the composition root described by
 | `DATABASE_MAX_OPEN_CONNS` | No | `10` | Maximum open connections in the PostgreSQL pool. |
 | `DATABASE_MAX_IDLE_CONNS` | No | `5` | Maximum idle connections retained. |
 | `DATABASE_CONN_MAX_LIFETIME` | No | `30m` | Maximum lifetime of a pooled connection. |
+| `REDIS_URL` | No | *(empty)* | go-redis connection URL, for example `redis://localhost:6379/0`. Empty disables the task-list cache. An invalid URL disables caching but does not stop startup. |
+| `REDIS_CACHE_TTL` | No | `60s` | Lifetime of a cached `GET /tasks` list. Must be positive; zero, negative, and unparsable values fall back to `60s`. |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warn`, or `error`; any other value falls back to `info`. |
 | `METRICS_TASKS_REFRESH_INTERVAL` | No | `15s` | How often `tasks_count` is re-read from PostgreSQL. Zero, negative, and unparsable values fall back to `15s`. |
-| `TEST_DATABASE_URL` | No | *(empty)* | Test-only DSN for integration tests; the service ignores it. |
+| `TEST_DATABASE_URL` | No | *(empty)* | Test-only DSN for PostgreSQL integration tests; the service ignores it. |
+| `TEST_REDIS_URL` | No | *(empty)* | Test-only Redis URL for integration tests; the service ignores it. Point it at a disposable server. |
 | `GIN_MODE` | No | `debug` | Read by Gin, not by the application configuration. `release` silences Gin's debug output. |
 
 Behavior worth knowing:
@@ -270,6 +297,10 @@ Behavior worth knowing:
   listener binds.
 - `DATABASE_URL` is validated with `pgx.ParseConfig`; the process pings the
   server and verifies the `tasks` table before serving requests.
+- `REDIS_URL` is validated with `go-redis`; an invalid URL disables the cache
+  with a warning instead of aborting startup. Redis is never required for
+  PostgreSQL-backed reads or writes, and cache failures fall back to the
+  database.
 
 ### Docker Compose variables
 
@@ -281,6 +312,8 @@ Behavior worth knowing:
 | `POSTGRES_PASSWORD` | `task_manager` | Local-development password for that role. Do not reuse it elsewhere. |
 | `POSTGRES_DB` | `task_manager` | Database created and migrated in the container. |
 | `APP_PORT` | `8080` | Host port published for the API. The container always listens on `8080`. |
+| `REDIS_PORT` | `6379` | Loopback host port for the Redis container; used by host integration tests and `redis-cli`. |
+| `REDIS_CACHE_TTL` | `60s` | Passed through to the API container as the list-cache TTL. |
 | `LOG_LEVEL` | `info` | Passed through to the API container. |
 
 Inside Compose, `DATABASE_URL` is assembled from the PostgreSQL variables and
@@ -292,6 +325,15 @@ docker compose exec postgres psql -U task_manager -d task_manager
 ```
 
 Substitute your `POSTGRES_USER` and `POSTGRES_DB` values if you overrode them.
+The API reaches Redis at `redis:6379`. Redis is published only on
+`127.0.0.1:${REDIS_PORT:-6379}` so host-side integration tests and `redis-cli`
+can reach it; it is not exposed on another interface and has no persistent
+volume.
+
+```bash
+docker compose exec redis redis-cli ping
+# PONG
+```
 
 ### Using `.env.example`
 
@@ -619,13 +661,14 @@ internal/infra/server (Gin router, health, 404/405)
 internal/task/handler (HTTP driving adapter)
     |
     v
-internal/task/service (use cases)
-    |
-    v
-service.Repository (interface declared by the service)
-    ^
-    |
-internal/task/repository/postgres (driven adapter, explicit SQL)
+internal/task/service (use cases; declares Repository and ListCache)
+    |                         |
+    v                         v
+service.Repository        service.ListCache
+    ^                         ^
+    |                         |
+internal/task/repository/postgres   internal/task/cache/redis
+    (driven adapter, explicit SQL)   (driven cache adapter)
 ```
 
 `internal/task/domain` holds the aggregate and invariants and has no framework
@@ -636,14 +679,21 @@ client but not on Gin; the HTTP package calls it through a narrow
 `server.Instrumentation` interface and mounts its handler. Only the PostgreSQL
 repository knows how to count persisted tasks.
 
+`internal/task/cache/redis` is the cache-aside driven adapter. It implements
+the `service.ListCache` port, owns the Redis key layout and generation token,
+and handles Redis failures; the service and domain packages never import
+Redis. The cache stores only the unfiltered `GET /tasks` list. PostgreSQL
+remains authoritative, and a cache read, write, or invalidation failure falls
+back to the database.
+
 ### Package responsibilities
 
 | Package | Responsibility |
 | --- | --- |
 | `cmd/task-manager` | Process entry point; constructs the app, calls `Initialize` and `Start`, and handles returned errors. |
 | `cmd/migrate` | Applies embedded migrations and exits non-zero on failure. |
-| `internal/app` | Composition root: loads config, builds the logger and pool, verifies the schema, composes HTTP modules through `buildHandlers`, builds the server, and shuts down in reverse order. |
-| `internal/infra/config` | Reads environment variables into plain structs and applies defaults. No network or filesystem I/O. |
+| `internal/app` | Composition root: loads config, builds the logger and pool, verifies the schema, constructs the optional Redis cache, composes HTTP modules through `buildHandlers`, builds the server, and shuts down in reverse order. |
+| `internal/infra/config` | Reads environment variables (including Redis URL and cache TTL) into plain structs and applies defaults. No network or filesystem I/O. |
 | `internal/infra/database` | Validates the DSN, opens the pooled `*sql.DB`, embeds and applies migrations, and verifies required tables. |
 | `internal/infra/server` | Builds the Gin router, request-ID and completion middleware, health and metrics endpoints, feature modules, and `404`/`405` handlers; owns HTTP lifecycle. Declares the narrow `HealthChecker`, `RouteRegistrar`, and `Instrumentation` interfaces. |
 | `internal/infra/handler` | Shared HTTP delivery code: the JSON error envelope and error writer. |
@@ -651,7 +701,8 @@ repository knows how to count persisted tasks.
 | `internal/infra/swagger` | Docs adapter: serves the embedded spec and Swagger UI under `/swagger`; registers only `GET`. |
 | `api` | Embeds `api/openapi.yaml` as `api.OpenAPI`; no business or transport logic. |
 | `internal/task/domain` | `Task`, the closed `Status` set, validation, and UUID identifier format and generation. |
-| `internal/task/service` | Create, list, get, update, and delete use cases; declares the `Repository` interface it consumes. |
+| `internal/task/service` | Create, list, get, update, and delete use cases; declares the `Repository` and `ListCache` interfaces it consumes and invalidates the list after committed mutations. |
+| `internal/task/cache/redis` | Cache-aside adapter for the task list: generation-token invalidation, finite TTL, JSON payload, malformed-data handling, and fail-open cache failures. |
 | `internal/task/handler` | Strict request decoding, path-ID validation, response mapping, and error mapping; declares the `TaskService` interface it consumes. |
 | `internal/task/repository/postgres` | Explicit SQL CRUD, identifier generation, `sql.ErrNoRows` to `service.ErrNotFound`, deterministic list order, and the `tasks` row count used by metrics. |
 
@@ -669,19 +720,24 @@ then `Start`. The composition root performs the actual wiring:
    the pool and stops startup.
 6. The task repository is constructed once and shared by the metrics refresher
    and the task module.
-7. `metrics.New` builds a dedicated Prometheus registry, and a
+7. If `REDIS_URL` is set, the Redis cache adapter is constructed. It does not
+   dial at construction. One best-effort generation reset runs at startup; an
+   invalid URL or an unavailable server is logged, and the service continues
+   with caching disabled or reads bypassed. Redis never stops startup.
+8. `metrics.New` builds a dedicated Prometheus registry, and a
    `TaskCountRefresher` is wired to the task repository with the configured
    refresh interval.
-8. `buildHandlers` (in `internal/app/wiring.go`) composes the HTTP modules —
-   the task handler over the repository port and the docs adapter — and returns
-   them as `server.RouteRegistrar` values.
-9. `server.New` receives the pool as the health checker, the metrics adapter as
-   `Instrumentation`, and the registrars returned by `buildHandlers`. It builds
-   the router with `gin.Recovery()`, request-ID and completion middleware,
-   health routes, `/metrics`, `/swagger/`, and feature routes.
-10. `Start` installs a signal context for `SIGINT`/`SIGTERM`, starts the
+9. `buildHandlers` (in `internal/app/wiring.go`) composes the HTTP modules —
+   the task handler over the repository and list-cache ports, plus the docs
+   adapter — and returns them as `server.RouteRegistrar` values.
+10. `server.New` receives the pool as the health checker, the metrics adapter
+    as `Instrumentation`, and the registrars returned by `buildHandlers`. It
+    builds the router with `gin.Recovery()`, request-ID and completion
+    middleware, health routes, `/metrics`, `/swagger/`, and feature routes.
+11. `Start` installs a signal context for `SIGINT`/`SIGTERM`, starts the
     task-count refresher, runs the server, shuts it down with a ten-second
-    budget, stops and waits for the refresher, and closes the pool.
+    budget, stops and waits for the refresher, closes the Redis client if one
+    is configured, and then closes the PostgreSQL pool.
 
 The server never imports the task packages or the database adapter. It knows
 only the narrow interfaces it declares itself:
@@ -731,6 +787,10 @@ internal/task/
     metrics and request IDs from the shared middleware. Never import Gin or
     Prometheus from `internal/task/domain` or `internal/task/service`, and do
     not add a second task-count source beside PostgreSQL.
+11. Cache invalidation is part of a mutation's contract: after a committed
+    task-list mutation, invalidate through the service. Do not delete keys in a
+    handler or bypass the use case. A new list-shaped read needs its own key
+    and invalidation decision; never reuse the unfiltered list key.
 
 ## 7. Database and Migrations
 
@@ -817,42 +877,74 @@ table between cases, so the integration suites refuse to run against a database
 whose name does not contain `test`:
 
 ```bash
+docker compose up -d redis
 export TEST_DATABASE_URL='postgres:///task_manager_test?host=localhost&sslmode=disable'
+export TEST_REDIS_URL='redis://localhost:6379/15'
 make test-integration
 ```
 
-Database-backed packages must run sequentially because they share one database;
-the Makefile and CI pass `-p 1`. Never point `TEST_DATABASE_URL` at a database
-whose data you need to keep.
+The Make target requires both URLs; the Redis setup is described in
+[Integration-test Redis](#integration-test-redis) below. Database-backed
+packages must run sequentially because they share one database; the Makefile
+and CI pass `-p 1`. Never point `TEST_DATABASE_URL` at a database whose data
+you need to keep.
+
+### Integration-test Redis
+
+The cache adapter tests use `TEST_REDIS_URL` and skip with an explicit message
+when it is unset. Each test uses a unique key prefix and cleans up after itself,
+but the URL should still point at a disposable Redis instance:
+
+```bash
+docker compose up -d redis
+export TEST_REDIS_URL='redis://localhost:6379/15'
+make test-integration \
+  TEST_DATABASE_URL='postgres:///task_manager_test?host=localhost&sslmode=disable' \
+  TEST_REDIS_URL='redis://localhost:6379/15'
+```
+
+The suite covers miss-then-hit, empty-list caching, expiration, generation
+invalidation, malformed payloads, concurrent first reads, and the stale-refill
+ordering. `make test-integration` refuses to run without both URLs; CI asserts
+that representative Redis tests ran rather than silently skipping.
+
+Never point `TEST_REDIS_URL` at a shared Redis database whose data you need.
 
 ## 8. Testing and Quality Checks
 
 The CI and coverage decisions are recorded in
-[ADR 0007](decisions/0007-ci-with-postgresql-service.md) and
-[ADR 0008](decisions/0008-containers-and-coverage-gate.md). The suite has two
-tiers:
+[ADR 0007](decisions/0007-ci-with-postgresql-service.md),
+[ADR 0008](decisions/0008-containers-and-coverage-gate.md), and
+[ADR 0013](decisions/0013-redis-cache-aside-for-task-list.md). The suite has
+three tiers:
 
-- **Database-free tests** cover the domain, service use cases, HTTP handler,
-  router, request correlation, metrics, docs adapter, configuration, and startup
-  error paths. They run without PostgreSQL.
+- **Infrastructure-free tests** cover the domain, service use cases and cache
+  decisions, HTTP handler, router, request correlation, metrics, docs adapter,
+  cache generation logic with a fake store, configuration, and startup error
+  paths. They run without PostgreSQL or Redis.
 - **PostgreSQL integration tests** cover the repository, migrations, and full
   app wiring. They run only when `TEST_DATABASE_URL` is set; otherwise they use
   `t.Skip` with an explicit message.
+- **Redis integration tests** cover cache commands against a real server:
+  miss-then-hit, empty lists, TTL expiry, mutation invalidation, malformed
+  payloads, concurrent generation initialization, and the stale-refill race.
+  They run only when `TEST_REDIS_URL` is set.
 
 The configuration tests clear the variables they assert on, so a preset `PORT`,
-`DATABASE_URL`, or logging variable cannot change their result.
+`DATABASE_URL`, `REDIS_URL`, or logging variable cannot change their result.
 
 | Task | Command |
 | --- | --- |
-| Database-free tests | `make test` or `go test ./...` |
-| Whole suite including PostgreSQL | `make test-integration TEST_DATABASE_URL='postgres:///task_manager_test?host=localhost&sslmode=disable'` |
+| Infrastructure-free tests | `make test` or `go test ./...` |
+| Whole suite including PostgreSQL and Redis | `make test-integration TEST_DATABASE_URL='postgres:///task_manager_test?host=localhost&sslmode=disable' TEST_REDIS_URL='redis://localhost:6379/15'` |
 | One package | `go test ./internal/task/handler` |
+| One cache package | `TEST_REDIS_URL=... go test ./internal/task/cache/redis` |
 | Verbose output | `go test -v ./...` |
-| Race detector against PostgreSQL | `TEST_DATABASE_URL=... go test -race -count=1 -p 1 ./...` |
-| Coverage summary | `TEST_DATABASE_URL=... go test -cover ./...` |
-| Coverage profile | `TEST_DATABASE_URL=... go test -coverprofile=coverage.out ./...` |
+| Race detector against PostgreSQL and Redis | `TEST_DATABASE_URL=... TEST_REDIS_URL=... go test -race -count=1 -p 1 ./...` |
+| Coverage summary | `TEST_DATABASE_URL=... TEST_REDIS_URL=... go test -cover ./...` |
+| Coverage profile | `TEST_DATABASE_URL=... TEST_REDIS_URL=... go test -coverprofile=coverage.out ./...` |
 | Browse coverage report | `go tool cover -html=coverage.out` |
-| Coverage gate (≥70%, requires PostgreSQL) | `make coverage-check TEST_DATABASE_URL=...` |
+| Coverage gate (≥70%, requires both) | `make coverage-check TEST_DATABASE_URL=... TEST_REDIS_URL=...` |
 | Vet | `make vet` or `go vet ./...` |
 | Formatting check | `make fmt` or `gofmt -l .` |
 | Apply formatting | `gofmt -w .` |
@@ -867,14 +959,16 @@ Important details:
   not rewrite files or fail. Use `gofmt -w .` to fix them. CI fails when any file
   is listed.
 - `coverage.out` matches `*.out` in `.gitignore`.
-- Measured statement coverage on this tree is **77.8%** with PostgreSQL and
-  **59.0%** without it. The PostgreSQL adapter only executes in the integration
-  tier.
+- Measured statement coverage on this tree is **80.1%** with PostgreSQL and
+  Redis, and lower without them. The PostgreSQL and Redis adapters only execute
+  in their integration tiers.
 - `make coverage-check` enforces `COVERAGE_MIN` (default `70`) on the combined
-  suite and refuses to run without `TEST_DATABASE_URL`. `make coverage` writes a
-  profile and prints the total but does not enforce the threshold.
-- Service and handler tests use hand-written fakes, not a mocking library. The
-  PostgreSQL adapter is verified against a real server, not with SQL mocks.
+  suite and refuses to run without both `TEST_DATABASE_URL` and
+  `TEST_REDIS_URL`. `make coverage` writes a profile and prints the total but
+  does not enforce the threshold.
+- Service, handler, and cache-decision tests use hand-written fakes, not a
+  mocking library. The PostgreSQL and Redis adapters are verified against real
+  servers, not with SQL or Redis mocks.
 - `internal/infra/metrics` tests cover success and failure counters, histogram
   units and buckets, bounded method/route labels, exposition output, scrape
   exclusion, and registry isolation. Task-count tests cover the initial value,
@@ -887,8 +981,18 @@ Important details:
 - The PostgreSQL suite includes `CountTasks` against a real table, including a
   row inserted outside the repository, so the gauge's source of truth is
   exercised rather than mocked.
+- `internal/task/service` tests prove cache hits skip the repository, empty
+  lists are hits, misses populate the cache, read/write failures fall back, and
+  only successful create/update/delete operations invalidate. They also prove
+  invalidation survives a canceled request context.
+- `internal/task/cache/redis` unit tests cover generation initialization, key
+  layout and TTL, empty and malformed payloads, degraded reads after a failed
+  invalidation, the rate-limited recovery probe (success and continued
+  failure), and the stale-refill ordering. Integration tests repeat the command-level behavior
+  against a real Redis server, including expiration and concurrent first reads.
 - `internal/app` tests cover a missing `DATABASE_URL`, a malformed DSN, an
-  unreachable server, a missing schema, and successful PostgreSQL wiring.
+  unreachable server, a missing schema, and successful PostgreSQL wiring with
+  caching disabled when `REDIS_URL` is empty.
 - `internal/infra/swagger` tests cover the exact embedded spec bytes, the UI
   index and `/swagger/index.html` alias, embedded CSS and JavaScript, the
   `GET`-only contract, unknown assets, and the trailing-slash redirect.
@@ -904,17 +1008,17 @@ Important details:
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to `main`,
 every pull request, and manual dispatch. It provisions a real PostgreSQL service
-(`postgres:16.4-alpine`) with an ephemeral `task_manager_test` database, then
-runs:
+(`postgres:16.4-alpine`) with an ephemeral `task_manager_test` database and a
+throwaway Redis service (`redis:7.4-alpine`), then runs:
 
 1. A formatting check that fails on any file `gofmt` would change.
 2. `go vet ./...` and `go build ./...`.
-3. Database-free tests with `TEST_DATABASE_URL` cleared.
+3. Infrastructure-free tests with both integration URLs cleared.
 4. `go run ./cmd/migrate` with `DATABASE_URL`.
-5. `make test-integration` with `TEST_DATABASE_URL`.
-6. An assertion that representative repository and migration tests report
-   `--- PASS` and that no `--- SKIP` occurred.
-7. `go test -race -count=1 -p 1 ./...` against the service database.
+5. `make test-integration` with `TEST_DATABASE_URL` and `TEST_REDIS_URL`.
+6. Assertions that representative PostgreSQL and Redis tests report `--- PASS`
+   and that no `--- SKIP` occurred.
+7. `go test -race -count=1 -p 1 ./...` against both services.
 8. `make coverage-check`, enforcing the 70% combined-suite threshold.
 9. A Docker image build, a non-root UID assertion, and
    `docker compose config --quiet`.
@@ -924,15 +1028,17 @@ credentials, and performs no deployment, publishing, or push.
 
 ## 9. Docker Compose
 
-`compose.yaml` defines three services under the project name `task-manager`.
+`compose.yaml` defines four services under the project name `task-manager`.
 The container and Compose decision is recorded in
-[ADR 0008](decisions/0008-containers-and-coverage-gate.md).
+[ADR 0008](decisions/0008-containers-and-coverage-gate.md); the cache design is
+in [ADR 0013](decisions/0013-redis-cache-aside-for-task-list.md).
 
 | Service | Image / command | Responsibility |
 | --- | --- | --- |
 | `postgres` | `postgres:16.4-alpine` | Stores the `tasks` table and `schema_migrations` in the named `pgdata` volume; health-checked with `pg_isready`. |
+| `redis` | `redis:7.4-alpine`, persistence disabled | Caches `GET /tasks` only. Health-checked with `redis-cli ping`; no volume, because PostgreSQL is authoritative. |
 | `migrate` | Same app image, entrypoint `/app/migrate` | Waits for PostgreSQL, applies pending migrations, and exits. It runs once, not as a long-lived service. |
-| `app` | Same app image, entrypoint `/app/task-manager` | Serves the API after PostgreSQL is healthy and migrations completed successfully. |
+| `app` | Same app image, entrypoint `/app/task-manager` | Serves the API after PostgreSQL is healthy and migrations completed. It waits for Redis only to be started, not to be healthy, because it can serve every request from PostgreSQL. |
 
 Start, inspect, and stop the stack:
 
@@ -946,11 +1052,17 @@ docker compose down
 The API is published on `${APP_PORT:-8080}`; the container listens on `8080`.
 PostgreSQL is not published on the host. The `app` service reaches it at the
 service name `postgres:5432` using a DSN assembled from the `POSTGRES_*`
-variables. This avoids collisions with a local PostgreSQL on port 5432.
+variables. Redis is reached at `redis:6379` through `REDIS_URL`. This avoids
+collisions with a local PostgreSQL on port 5432.
+
+Redis publishes only a loopback port, `127.0.0.1:${REDIS_PORT:-6379}`, for
+host-side integration tests and `redis-cli`; it is not reachable on another
+interface. It uses no volume and disables RDB/AOF persistence, so a Redis
+restart or removal only causes cache misses.
 
 Metrics use the same application port: `curl -s http://localhost:8080/metrics`
-(or `:${APP_PORT}` when overridden). No additional port is published, so
-PostgreSQL and other internal services stay unreachable from the host.
+(or `:${APP_PORT}` when overridden). No additional API port is published, so
+PostgreSQL and Redis stay unreachable from another host.
 
 If the migration fails, the `app` service is not started. Inspect the migration
 logs and re-run it:
@@ -975,8 +1087,10 @@ when PostgreSQL is unreachable.
 
 PostgreSQL data lives in the named volume `task-manager_pgdata`. It survives
 container restarts, `docker compose down`, image rebuilds, and host reboots.
-`docker compose down -v` is the explicit destructive command and removes the
-volume and all tasks. To build the image without Compose:
+Redis intentionally has no volume: losing the cache is always recoverable from
+PostgreSQL and simply causes misses. `docker compose down -v` is the explicit
+destructive command and removes the PostgreSQL volume and all tasks. To build
+the image without Compose:
 
 ```bash
 docker build -t task-manager:local .
@@ -987,6 +1101,7 @@ docker build -t task-manager:local .
 | Decision | Benefit | Cost / limitation |
 | --- | --- | --- |
 | PostgreSQL is the only task store, with no fallback | Data is durable and every process shares one source of truth | The service cannot run or serve a request without PostgreSQL; local setup needs a database |
+| Redis cache-aside for `GET /tasks`, invalidated by a generation token | Repeated list reads skip PostgreSQL; a slow reader cannot republish a pre-mutation list | One extra Redis round trip on successful writes; a failed invalidation disables cache reads until a recovery probe succeeds (about five seconds later) or a mutation invalidates again; cached data is eventually consistent within the TTL |
 | PostgreSQL via `database/sql` and pgx, without an ORM | Explicit SQL, standard-library interfaces, and no ORM mapping layer | SQL is written and maintained by hand; repository behavior is only proven with integration tests |
 | UUID identifiers instead of integers | IDs are opaque, unguessable, and generated without coordination | IDs are larger, and list order by UUID is not creation order |
 | Strict JSON decoding and full-replacement `PUT` | Typos and contract drift fail loudly; replacement semantics are unambiguous | Clients must send every replacement field, and extra metadata is rejected |
@@ -996,7 +1111,7 @@ docker build -t task-manager:local .
 | Pull-based Prometheus metrics in-process | Standard format and no agent or metrics backend is required; any scraper can consume it | The service does not store, aggregate, or alert on the data; `/metrics` is unauthenticated like the rest of the API |
 | `tasks_count` refreshed on an interval instead of per request | No table scan on the request path; the value reflects PostgreSQL rather than process memory | Eventually consistent up to one interval; stale but timestamped when PostgreSQL is unavailable, and absent before the first success |
 | Request correlation via `X-Request-ID` instead of OpenTelemetry | Cheap, dependency-free log correlation; every response carries the ID | It is not distributed tracing: no spans, sampling, propagation into PostgreSQL, or trace backend |
-| 70% coverage gate on the combined suite | The gate measures the PostgreSQL adapter as well as unit tests | It requires a live test database and a longer CI job |
+| 70% coverage gate on the combined suite | The gate measures the PostgreSQL and Redis adapters as well as unit tests | It requires live test services and a longer CI job |
 | Small, single-aggregate service | Easy to understand, test, and deploy | No authentication, pagination, filtering, sorting, search, timestamps, or multi-tenancy |
 
 Intentional scope limits are listed in [Overview](#1-overview). They are not
@@ -1017,6 +1132,11 @@ A few operational constraints are worth repeating:
   at the network edge. It is not part of the OpenAPI document.
 - `tasks_count` is not a transactional inventory. Do not use it for billing or
   exact reconciliation; query PostgreSQL when exact state is required.
+- The task list cache is not a transactional view. A `GET /tasks` that began
+  before a mutation may return the pre-mutation list; requests that begin after
+  the mutation use the new generation. If invalidation fails, the process serves
+  PostgreSQL directly and logs the failure rather than continuing to serve the
+  old generation.
 
 ## 11. Troubleshooting
 
@@ -1026,8 +1146,9 @@ A few operational constraints are worth repeating:
 | `ping: ... connection refused` or `database unreachable` | PostgreSQL is not running, the host/port is wrong, or Compose is using the wrong host | Run `pg_isready`, check `docker compose logs postgres`, and remember that the Compose host is `postgres`, not `localhost` |
 | `role "..." does not exist` or authentication failure | The DSN role/database does not exist or the password is wrong | Create the role/database or correct `DATABASE_URL`; do not commit credentials |
 | `schema is not initialized: table "tasks" is missing` | Migrations were never applied, or were applied to another database | Run `make migrate` locally or `docker compose run --rm migrate` |
-| Integration tests skip with `TEST_DATABASE_URL is not set` | The integration tier was not enabled | Export `TEST_DATABASE_URL`; use `make test-integration` to fail instead of skipping |
-| `make coverage-check` refuses to run | `TEST_DATABASE_URL` is unset | Provide the test DSN; the gate intentionally requires the database tier |
+| Integration tests skip with `TEST_DATABASE_URL is not set` | The PostgreSQL integration tier was not enabled | Export `TEST_DATABASE_URL`; use `make test-integration` to fail instead of skipping |
+| Integration tests skip with `TEST_REDIS_URL is not set` | The Redis integration tier was not enabled | Start Redis (`docker compose up -d redis`) and export `TEST_REDIS_URL` |
+| `make coverage-check` refuses to run | `TEST_DATABASE_URL` or `TEST_REDIS_URL` is unset | Provide both test URLs; the gate intentionally requires both adapter tiers |
 | `bind: address already in use` on `:8080` | Another process uses the port | Run `PORT=9090 make run`, or publish `APP_PORT=9090` with Compose |
 | `docker compose` cannot connect the app to PostgreSQL | The `migrate` service failed or PostgreSQL is unhealthy | Check `docker compose ps`, `docker compose logs postgres`, and `docker compose logs migrate`; the app waits for both |
 | Tasks disappear after `docker compose down` | The volume was removed with `-v` | Use `docker compose down` without `-v`; `down -v` is intentionally destructive |
@@ -1036,6 +1157,10 @@ A few operational constraints are worth repeating:
 | `/metrics` returns `404` | The binary predates the observability phase, or a test server was built without instrumentation | Rebuild/restart the service; `internal/app` always wires the endpoint |
 | `tasks_count` is missing from `/metrics` | No refresh has succeeded yet (database down, schema missing, or first refresh still running) | Check `/health`, the application log for `task count refresh failed`, and the refresh interval |
 | `tasks_count` looks stale | PostgreSQL became unavailable, or the refresh interval is large | Compare `time()` with `tasks_count_last_refresh_timestamp_seconds`; check database connectivity and `METRICS_TASKS_REFRESH_INTERVAL` |
+| `redis cache disabled` or `redis cache unavailable at startup` in the log | `REDIS_URL` is malformed or Redis is unreachable | The API still serves from PostgreSQL. Correct the URL or start Redis; a restart re-attempts the generation reset |
+| `task list cache failure` warnings on every GET | Redis is down, or invalidation failed earlier and the adapter is degraded | Check Redis health. The process bypasses the cache and serves PostgreSQL. A recovery probe retries every five seconds and a successful mutation invalidates immediately, so caching resumes once Redis answers |
+| `GET /tasks` keeps returning an old list after a write | The mutation failed (so it was not committed), or invalidation failed and was logged | Check the write response and the `task list cache invalidation failed` log. The cache is bypassed after that error; investigate Redis before restarting |
+| Compose starts `app` but the log shows `redis cache unavailable at startup` | Redis was started but not ready, or is down; `app` waits only for the container to start | Expected. The API serves PostgreSQL and the adapter retries every five seconds, so caching resumes without a restart |
 | Every response has an unexpected `X-Request-ID` | A proxy supplied an invalid or oversized header, so the service replaced it | Expected; the response header always contains the final identifier, which also appears in the request log |
 | Redocly reports a missing `license` warning | The repository does not declare a license | This is advisory; validation still succeeds. Do not add a false license just to silence it |
 
@@ -1060,16 +1185,17 @@ A few operational constraints are worth repeating:
 │   │   ├── server/                 Gin router, middleware, request IDs, health, /metrics, 404/405
 │   │   └── swagger/                embedded spec and Swagger UI adapter
 │   └── task/
+│       ├── cache/redis/            Redis list-cache adapter and generation token
 │       ├── domain/                 Task aggregate, statuses, validation, UUIDs
 │       ├── handler/                HTTP driving adapter
 │       ├── repository/postgres/    explicit-SQL driven adapter
-│       └── service/                use cases and repository interface
-├── .github/workflows/ci.yml        CI with PostgreSQL, tests, coverage, Docker
+│       └── service/                use cases, repository and list-cache ports
+├── .github/workflows/ci.yml        CI with PostgreSQL, Redis, tests, coverage, Docker
 ├── .env.example                    core environment template
 ├── .dockerignore                   build-context exclusions
 ├── Dockerfile                      multi-stage, non-root image
 ├── Makefile                        build, run, migrate, test, coverage, vet, fmt
-├── compose.yaml                    PostgreSQL, one-shot migration, API
+├── compose.yaml                    PostgreSQL, Redis, one-shot migration, API
 ├── go.mod / go.sum                 module and dependency checksums
 └── README.md                       this guide
 ```
@@ -1098,6 +1224,7 @@ as the practical guide for setup, operation, and the current API.
 | [0010. Prometheus metrics and request correlation for HTTP observability](decisions/0010-prometheus-metrics-and-request-correlation.md) | Expose bounded request metrics, an eventually consistent PostgreSQL-backed task gauge, and `X-Request-ID` correlation from a dedicated registry; no OpenTelemetry. | Accepted |
 | [0011. One composition point for HTTP module handlers](decisions/0011-http-handler-composition.md) | Compose HTTP modules through `buildHandlers` returning `server.RouteRegistrar` values; keep lifecycle in the composition root and avoid a plugin framework. | Accepted |
 | [0012. Consumer-owned ports remain the dependency-inversion boundary](decisions/0012-consumer-owned-ports-dependency-audit.md) | Audit the import graph against the dependency rule: ports stay with consumers, adapters and the composition root point inward, and no production code needed to change. | Accepted |
+| [0013. Redis cache-aside for task listing with generation-token invalidation](decisions/0013-redis-cache-aside-for-task-list.md) | Cache `GET /tasks` in Redis with a generation token; invalidate after committed creates, updates, and deletes, and fail open to PostgreSQL when Redis is unavailable. | Accepted |
 
 No record is superseded or deprecated. ADRs 0003, 0004, and 0007 carry amendment
 notes because later records refine part of their decision; read the amending ADR
