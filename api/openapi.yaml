@@ -403,7 +403,6 @@ components:
         minLength: 1
         maxLength: 64
         pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
-        example: 6f1c2a4e8d3b4f5a9c7e1a2b3c4d5e6f
     TaskId:
       name: id
       in: path
@@ -413,7 +412,6 @@ components:
         type: string
         format: uuid
         pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-        example: 6f1c2a4e-8d3b-4f5a-9c7e-1a2b3c4d5e6f
     StatusFilter:
       name: status
       in: query
@@ -442,23 +440,25 @@ components:
       in: query
       required: false
       description: |
-        One-based page number. Defaults to 1. A page beyond the last one is a
-        valid request and returns an empty `items` array with the correct
-        totals.
+        One-based page number. When omitted, the service defaults to 1 (not
+        declared as an OpenAPI `default`, so Swagger UI Try it out stays empty).
+        A page beyond the last one is a valid request and returns an empty
+        `items` array with the correct totals.
       schema:
         type: integer
         minimum: 1
-        default: 1
     PageSize:
       name: page_size
       in: query
       required: false
-      description: Maximum number of tasks in one page. Defaults to 20; the largest accepted value is 100.
+      description: |
+        Maximum number of tasks in one page. When omitted, the service defaults
+        to 20 (not declared as an OpenAPI `default`, so Swagger UI Try it out
+        stays empty). The largest accepted value is 100.
       schema:
         type: integer
         minimum: 1
         maximum: 100
-        default: 20
   headers:
     RequestId:
       description: |
@@ -603,21 +603,19 @@ components:
           type: string
           minLength: 1
           description: Short task title. Whitespace-only values are rejected.
-          example: Write the report
         description:
           type: string
-          default: ''
-          description: Optional longer description, stored as sent.
-          example: Cover the API contract.
+          description: |
+            Optional longer description, stored as sent. When omitted, the
+            service stores an empty string.
         status:
           allOf:
             - $ref: '#/components/schemas/TaskStatus'
-          default: todo
-          description: Workflow status.
+          description: |
+            Workflow status. When omitted, the service stores `todo`.
         assignee:
           type: string
           maxLength: 100
-          default: ''
           description: |
             Optional owner label, trimmed before storage. Omitting it (or
             sending an empty string) stores the task as unassigned.
