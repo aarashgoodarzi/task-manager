@@ -5,14 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"net/http"
+	"net/http/httptest"
+
+	goredis "github.com/redis/go-redis/v9"
 )
 
 func TestPercentileUsesNearestRank(t *testing.T) {
@@ -79,6 +83,43 @@ func TestExitCode(t *testing.T) {
 	if got := exitCode(fmt.Errorf("wrapped: %w", errFailedRequests)); got != 1 {
 		t.Errorf("exitCode(failures) = %d, want 1", got)
 	}
+	if got := exitCode(fmt.Errorf("wrapped: %w", errEvidenceFailed)); got != 1 {
+		t.Errorf("exitCode(evidence) = %d, want 1", got)
+	}
+}
+
+func TestEvaluateCacheEvidenceWarm(t *testing.T) {
+	ok := evidenceDelta{hits: 100, misses: 0, variantDelta: 0, afterKeys: 1}
+	if err := evaluateCacheEvidence(modeWarm, 50, ok); err != nil {
+		t.Fatalf("warm OK evidence: %v", err)
+	}
+	cases := []struct {
+		name string
+		d    evidenceDelta
+	}{
+		{"misses", evidenceDelta{hits: 10, misses: 1, variantDelta: 0, afterKeys: 1}},
+		{"new keys", evidenceDelta{hits: 10, misses: 0, variantDelta: 2, afterKeys: 3}},
+		{"no keys", evidenceDelta{hits: 10, misses: 0, variantDelta: 0, afterKeys: 0}},
+	}
+	for _, tc := range cases {
+		err := evaluateCacheEvidence(modeWarm, 50, tc.d)
+		if !errors.Is(err, errEvidenceFailed) {
+			t.Errorf("%s: err = %v, want errEvidenceFailed", tc.name, err)
+		}
+	}
+}
+
+func TestEvaluateCacheEvidenceMiss(t *testing.T) {
+	ok := evidenceDelta{hits: 10, misses: 10, variantDelta: 10, afterKeys: 11}
+	if err := evaluateCacheEvidence(modeMiss, 10, ok); err != nil {
+		t.Fatalf("miss OK evidence: %v", err)
+	}
+	if err := evaluateCacheEvidence(modeMiss, 10, evidenceDelta{hits: 10, misses: 9, variantDelta: 10, afterKeys: 11}); !errors.Is(err, errEvidenceFailed) {
+		t.Fatalf("too few misses: err = %v", err)
+	}
+	if err := evaluateCacheEvidence(modeMiss, 10, evidenceDelta{hits: 10, misses: 10, variantDelta: 9, afterKeys: 10}); !errors.Is(err, errEvidenceFailed) {
+		t.Fatalf("too few keys: err = %v", err)
+	}
 }
 
 func TestParseFlagsDefaultsAndValidation(t *testing.T) {
@@ -102,6 +143,7 @@ func TestParseFlagsDefaultsAndValidation(t *testing.T) {
 		{"zero timeout", []string{"-timeout", "0s"}},
 		{"remote seed", []string{"-base-url", "http://192.0.2.10:8080", "-seed", "10"}},
 		{"fragment in base url", []string{"-base-url", "http://127.0.0.1:8080/#x"}},
+		{"path in base url", []string{"-base-url", "http://127.0.0.1:8080/api"}},
 		{"stray argument", []string{"extra"}},
 		{"unknown flag", []string{"-nope"}},
 	}
@@ -109,6 +151,16 @@ func TestParseFlagsDefaultsAndValidation(t *testing.T) {
 		if _, err := parseFlags(tc.args, &strings.Builder{}); err == nil {
 			t.Errorf("%s: parseFlags succeeded, want an error", tc.name)
 		}
+	}
+}
+
+func TestParseFlagsRejectsBaseURLWithPathAsUsage(t *testing.T) {
+	_, err := parseFlags([]string{"-base-url", "http://127.0.0.1:8080/api"}, &strings.Builder{})
+	if !errors.Is(err, errUsage) {
+		t.Fatalf("err = %v, want errUsage", err)
+	}
+	if got := exitCode(err); got != 2 {
+		t.Fatalf("exitCode = %d, want 2", got)
 	}
 }
 
@@ -332,16 +384,72 @@ func TestRunKeepLeavesDatasetAndReportsIt(t *testing.T) {
 	}
 }
 
-func TestRunRejectsBaseURLWithPath(t *testing.T) {
-	_, err := url.Parse("http://127.0.0.1:8080")
-	if err != nil {
-		t.Fatal(err)
+func TestRunWarmupFailureAbortsBeforeMeasurement(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		if n <= 3 {
+			http.Error(w, "warmup boom", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"page":1,"page_size":20,"total":0,"total_pages":0}`))
+	}))
+	defer srv.Close()
+
+	out := &strings.Builder{}
+	err := run(context.Background(), options{
+		baseURL: srv.URL, query: "page=1", requests: 10, concurrency: 1,
+		timeout: time.Second, warmup: 3, mode: modeWarm, redisPrefix: "task-manager",
+	}, out)
+	if !errors.Is(err, errFailedRequests) {
+		t.Fatalf("run error = %v, want errFailedRequests\n%s", err, out)
 	}
-	err = run(context.Background(), options{
-		baseURL: "http://127.0.0.1:8080/api", query: "page=1", requests: 1, concurrency: 1,
-		timeout: time.Second, mode: modeWarm, redisPrefix: "task-manager",
-	}, &strings.Builder{})
-	if err == nil {
-		t.Fatal("run accepted a base URL with a path")
+	if !strings.Contains(err.Error(), "warmup") {
+		t.Fatalf("error = %v, want a warmup failure", err)
+	}
+	if got := hits.Load(); got != 3 {
+		t.Fatalf("server received %d requests, want only the 3 warmup attempts", got)
+	}
+}
+
+func TestMissModeReplaceGenerationUpdatesRedisKey(t *testing.T) {
+	redisURL := os.Getenv("TEST_REDIS_URL")
+	if redisURL == "" {
+		t.Skip("TEST_REDIS_URL is not set; skipping miss-mode Redis generation test")
+	}
+
+	opts, err := goredis.ParseURL(redisURL)
+	if err != nil {
+		t.Fatalf("parse TEST_REDIS_URL: %v", err)
+	}
+	client := goredis.NewClient(opts)
+	t.Cleanup(func() { _ = client.Close() })
+
+	prefix := fmt.Sprintf("loadtest-miss-%d", time.Now().UnixNano())
+	genKey := prefix + ":tasks:list:generation"
+	ctx := context.Background()
+	if err := client.Set(ctx, genKey, "before-token", 0).Err(); err != nil {
+		t.Fatalf("seed generation key: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Del(ctx, genKey).Err() })
+
+	r := &runner{
+		mode:   modeMiss,
+		redis:  client,
+		genKey: genKey,
+	}
+	if err := r.replaceGeneration(ctx); err != nil {
+		t.Fatalf("replaceGeneration: %v", err)
+	}
+	got, err := client.Get(ctx, genKey).Result()
+	if err != nil {
+		t.Fatalf("read generation: %v", err)
+	}
+	if got == "" || got == "before-token" {
+		t.Fatalf("generation = %q, want a fresh token replacing before-token", got)
+	}
+	if len(got) != 32 {
+		t.Fatalf("generation length = %d, want 32 hex chars", len(got))
 	}
 }

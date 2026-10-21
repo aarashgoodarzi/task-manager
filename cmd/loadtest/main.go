@@ -34,6 +34,11 @@ import (
 // a successful measurement in CI or a script.
 var errFailedRequests = errors.New("one or more requests failed")
 
+// errEvidenceFailed reports that Redis cache evidence contradicted the
+// requested mode (or could not be collected after -redis-url was supplied).
+// Exit status is 1: the run is not a valid benchmark claim.
+var errEvidenceFailed = errors.New("cache evidence failed")
+
 // errUsage marks invalid flags or options; main maps it to exit status 2.
 var errUsage = errors.New("invalid usage")
 
@@ -76,7 +81,7 @@ func parseFlags(args []string, out io.Writer) (options, error) {
 	fs.DurationVar(&o.timeout, "timeout", 5*time.Second, "per-request timeout")
 	fs.IntVar(&o.warmup, "warmup", 20, "requests sent before measuring to prime the cache (warm mode)")
 	fs.StringVar(&o.mode, "mode", modeWarm, "cache mode: warm or miss")
-	fs.StringVar(&o.redisURL, "redis-url", "", "Redis URL (required for miss mode; enables cache evidence)")
+	fs.StringVar(&o.redisURL, "redis-url", "", "Redis URL (required for miss mode; when set, cache evidence is required and must match the mode)")
 	fs.StringVar(&o.redisPrefix, "redis-prefix", "task-manager", "cache key prefix used by the service")
 	fs.IntVar(&o.seed, "seed", 0, "create this many tasks before measuring and delete them afterwards (0 disables)")
 	fs.BoolVar(&o.keep, "keep", false, "keep seeded tasks instead of deleting them")
@@ -112,6 +117,9 @@ func (o options) validate() error {
 	}
 	if base.RawQuery != "" || base.Fragment != "" {
 		return fmt.Errorf("%w: pass list parameters with -query, not in -base-url", errUsage)
+	}
+	if base.Path != "" && base.Path != "/" {
+		return fmt.Errorf("%w: base URL must not include a path; pass list parameters with -query", errUsage)
 	}
 	if _, err := url.ParseQuery(strings.TrimPrefix(o.query, "?")); err != nil {
 		return fmt.Errorf("%w: query: %v", errUsage, err)
@@ -163,8 +171,9 @@ func isLoopbackURL(u *url.URL) bool {
 }
 
 // exitCode maps failures to shell statuses: 2 for unusable options, 1 for a
-// measurement that ran but did not succeed (failed requests, transport errors,
-// or a cleanup that could not finish), 0 only for a fully successful run.
+// measurement that ran but did not succeed (failed requests, failed warmup,
+// contradictory or missing required cache evidence, transport errors, or a
+// cleanup that could not finish), 0 only for a fully successful run.
 func exitCode(err error) int {
 	switch {
 	case err == nil:

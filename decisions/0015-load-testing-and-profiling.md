@@ -55,8 +55,12 @@ service already depends on `go-redis`). It sends `GET /tasks` with:
 - success defined as a 2xx response with a fully drained body; non-2xx statuses
   and transport errors are counted, sampled in the report, and make the process
   exit non-zero;
-- exit status `2` for unusable options, `1` for failed requests or failed
-  cleanup, `0` only for a fully successful run.
+- warm-mode warmup (when `-warmup > 0`) is required for a valid warm claim: any
+  warmup failure aborts the run before measurement;
+- exit status `2` for unusable options (including a base URL that contains a
+  path), `1` for failed requests, failed warmup, failed cleanup, or required
+  cache-evidence checks that are missing or contradict the mode, `0` only for a
+  fully successful run.
 
 Response bodies are discarded. The report never includes task content, and
 failure samples contain only the status code or transport error text.
@@ -84,16 +88,18 @@ The service caches one entry per normalized query under a generation token
 (ADR 0013). That makes both scenarios verifiable:
 
 - **warm**: a warmup phase sends the same query, then the measured phase reuses
-  it. With `-redis-url`, the tool reports deltas of `keyspace_hits`,
-  `keyspace_misses`, and the number of `<prefix>:tasks:list:*` keys. A warm run
-  must show no new list keys and no misses.
+  it. When `-redis-url` is omitted, evidence is skipped and the HTTP timing
+  alone is reported. When `-redis-url` is set, evidence is **required**: the
+  tool fails the run (exit 1) unless the measured phase shows zero
+  `keyspace_misses`, an unchanged list-key count, and at least one
+  `<prefix>:tasks:list:*` variant key still present.
 - **miss**: before each timed request the tool writes 128 fresh random bits to
   `<prefix>:tasks:list:generation`, so the following lookup addresses a
   generation that was never cached. The variant read is then a Redis miss and
   the request reads PostgreSQL. This mode requires `-concurrency 1`, because a
   concurrent request could repopulate the cache and turn later requests into
-  hits. The tool reports one generation hit and one variant miss per request,
-  plus one new list key per request, as evidence.
+  hits. `-redis-url` is mandatory; evidence must show at least one new list key
+  and one keyspace miss per measured request, or the run fails.
 
 The comparison is therefore stated as a single-threaded pair, not as a claim
 about concurrent behavior. Measured numbers live in the README section

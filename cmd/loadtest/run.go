@@ -11,13 +11,14 @@ import (
 
 // run executes one scenario end to end: optional cache setup, optional dataset
 // seeding, a warmup phase, the measured phase, cache evidence, and cleanup.
+//
+// Flag validation (including rejecting a base URL with a path) happens in
+// options.validate before run is called.
 func run(ctx context.Context, o options, out io.Writer) error {
 	base, err := url.Parse(o.baseURL)
 	if err != nil {
-		return fmt.Errorf("base URL: %w", err)
-	}
-	if base.Path != "" && base.Path != "/" {
-		return fmt.Errorf("base URL %q must not include a path", o.baseURL)
+		// validate already checked this; keep a defensive guard for direct callers.
+		return fmt.Errorf("%w: base URL: %v", errUsage, err)
 	}
 
 	transport := &http.Transport{
@@ -50,21 +51,24 @@ func run(ctx context.Context, o options, out io.Writer) error {
 	}
 	fmt.Fprintln(out)
 
-	// Redis is optional for warm mode (evidence only) and required for miss
-	// mode (the generation token is the mechanism that creates a miss).
+	// Redis is optional only when -redis-url is omitted (warm mode without
+	// evidence). When the URL is set, evidence is required and must match the
+	// mode; miss mode already requires the URL for generation replacement.
+	requireEvidence := o.redisURL != ""
 	redisReady := false
 	var before cacheSnapshot
 	if r.redis != nil {
 		if err := r.redis.Ping(ctx).Err(); err != nil {
-			if o.mode == modeMiss {
-				return fmt.Errorf("redis is required for miss mode: %w", err)
+			if o.mode == modeMiss || requireEvidence {
+				return fmt.Errorf("%w: redis unreachable: %v", errEvidenceFailed, err)
 			}
-			fmt.Fprintf(out, "cache evidence unavailable: %v\n\n", err)
 		} else {
 			redisReady = true
 		}
+	} else if requireEvidence {
+		return fmt.Errorf("%w: -redis-url was set but the Redis client was not configured", errEvidenceFailed)
 	} else {
-		fmt.Fprintf(out, "cache evidence unavailable: run with -redis-url to report Redis hits and misses\n\n")
+		fmt.Fprintf(out, "cache evidence skipped: pass -redis-url to require and verify Redis hits and misses\n\n")
 	}
 
 	var ds dataset
@@ -97,13 +101,22 @@ func run(ctx context.Context, o options, out io.Writer) error {
 		warm := r.runPhase(ctx, o.warmup)
 		if warm.failures > 0 {
 			fmt.Fprintf(out, "warmup: %d of %d requests failed\n", warm.failures, o.warmup)
+			if !o.keep {
+				_ = cleanup()
+			}
+			return fmt.Errorf("%w: warmup: %d of %d requests failed", errFailedRequests, warm.failures, o.warmup)
 		}
 	}
 
 	if redisReady {
 		before, err = snapshotCache(ctx, r.redis, o.redisPrefix, r.listMatch)
 		if err != nil {
-			fmt.Fprintf(out, "cache evidence unavailable: %v\n", err)
+			if requireEvidence {
+				if !o.keep {
+					_ = cleanup()
+				}
+				return fmt.Errorf("%w: snapshot before measurement: %v", errEvidenceFailed, err)
+			}
 			redisReady = false
 		}
 	}
@@ -115,7 +128,12 @@ func run(ctx context.Context, o options, out io.Writer) error {
 	if cacheOK {
 		after, err = snapshotCache(ctx, r.redis, o.redisPrefix, r.listMatch)
 		if err != nil {
-			fmt.Fprintf(out, "cache evidence incomplete: %v\n", err)
+			if requireEvidence {
+				if !o.keep {
+					_ = cleanup()
+				}
+				return fmt.Errorf("%w: snapshot after measurement: %v", errEvidenceFailed, err)
+			}
 			cacheOK = false
 		}
 	}
@@ -151,27 +169,26 @@ func run(ctx context.Context, o options, out io.Writer) error {
 		fmt.Fprintln(out)
 	}
 
+	var evidenceErr error
 	if cacheOK {
-		hits := after.hits - before.hits
-		misses := after.misses - before.misses
-		variantDelta := after.variantKeys - before.variantKeys
+		delta := evidenceDelta{
+			hits:         after.hits - before.hits,
+			misses:       after.misses - before.misses,
+			variantDelta: after.variantKeys - before.variantKeys,
+			afterKeys:    after.variantKeys,
+		}
 		fmt.Fprintf(out, "cache evidence (%s, prefix %q)\n", o.redisURL, o.redisPrefix)
-		fmt.Fprintf(out, "  keyspace     hits +%d, misses +%d during the measured phase\n", hits, misses)
-		fmt.Fprintf(out, "  list keys    %d -> %d (delta %+d)\n", before.variantKeys, after.variantKeys, variantDelta)
-		switch o.mode {
-		case modeWarm:
-			if misses > int64(o.requests)/10 {
-				fmt.Fprintf(out, "  note         misses are non-trivial; the cache may have expired mid-run (REDIS_CACHE_TTL)\n")
-			}
-			if after.variantKeys == 0 {
-				fmt.Fprintf(out, "  note         no cached list key found; this run did not exercise the cache path\n")
-			}
-		case modeMiss:
-			if int(variantDelta) < o.requests {
-				fmt.Fprintf(out, "  note         fewer list keys were written than requests; some requests may not have missed\n")
-			}
+		fmt.Fprintf(out, "  keyspace     hits +%d, misses +%d during the measured phase\n", delta.hits, delta.misses)
+		fmt.Fprintf(out, "  list keys    %d -> %d (delta %+d)\n", before.variantKeys, after.variantKeys, delta.variantDelta)
+		evidenceErr = evaluateCacheEvidence(o.mode, o.requests, delta)
+		if evidenceErr != nil {
+			fmt.Fprintf(out, "  verdict      FAILED: %v\n", evidenceErr)
+		} else {
+			fmt.Fprintf(out, "  verdict      OK for %s mode\n", o.mode)
 		}
 		fmt.Fprintln(out)
+	} else if requireEvidence {
+		evidenceErr = fmt.Errorf("%w: required Redis evidence was not collected", errEvidenceFailed)
 	}
 
 	if cleanupErr != nil {
@@ -179,6 +196,9 @@ func run(ctx context.Context, o options, out io.Writer) error {
 	}
 	if s.Failed > 0 {
 		return fmt.Errorf("%w: %d of %d requests failed", errFailedRequests, s.Failed, s.Requests)
+	}
+	if evidenceErr != nil {
+		return evidenceErr
 	}
 	return nil
 }
