@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -33,9 +32,10 @@ const (
 // beside its only consumer, rather than in a shared ports package.
 type Repository interface {
 	Create(ctx context.Context, task domain.Task) (domain.Task, error)
-	// ListPage returns one page of matching tasks and the total number of
-	// matching tasks before pagination. Both values come from the same filter
-	// so the page and its metadata cannot disagree.
+	// ListPage returns one page of matching tasks ordered by id ascending.
+	// When AfterID is set, only rows with id greater than AfterID are returned.
+	// Limit is the maximum number of rows to fetch; the use case may request
+	// one extra row to detect whether another page exists.
 	ListPage(ctx context.Context, filter Filter) (TaskPage, error)
 	Get(ctx context.Context, id string) (domain.Task, error)
 	Update(ctx context.Context, task domain.Task) (domain.Task, error)
@@ -60,16 +60,21 @@ type ListQuery struct {
 	// empty value means "any"; unassigned tasks are not selectable in this
 	// version.
 	Assignee string
-	// Page is one-based. Zero means the first page.
-	Page int
+	// Cursor is the opaque pagination token from a previous response. Empty
+	// means the first page. A malformed or incompatible cursor is rejected.
+	Cursor string
 	// PageSize is the maximum number of tasks in the page. Zero means
 	// DefaultPageSize.
 	PageSize int
+	// AfterID is the exclusive lower bound derived from Cursor. It is empty
+	// for the first page and is set by Normalize; callers should not set it.
+	AfterID string
 }
 
 // Normalize applies the documented defaults and rejects values outside the
-// supported range. It is idempotent, so an HTTP adapter may validate a request
-// once and the use case may rely on the same rules.
+// supported range. It decodes and binds the cursor to this query's filters and
+// page size. It is idempotent, so an HTTP adapter may validate a request once
+// and the use case may rely on the same rules.
 func (q ListQuery) Normalize() (ListQuery, error) {
 	if q.Status != "" && !q.Status.Valid() {
 		return ListQuery{}, &domain.ValidationError{
@@ -86,14 +91,6 @@ func (q ListQuery) Normalize() (ListQuery, error) {
 		}
 	}
 
-	page := q.Page
-	if page == 0 {
-		page = 1
-	}
-	if page < 0 {
-		return ListQuery{}, &domain.ValidationError{Field: "page", Message: "page must be at least 1"}
-	}
-
 	pageSize := q.PageSize
 	if pageSize == 0 {
 		pageSize = DefaultPageSize
@@ -108,40 +105,46 @@ func (q ListQuery) Normalize() (ListQuery, error) {
 		}
 	}
 
-	// The offset is (page-1)*page_size and must fit in an int64 for the SQL
-	// parameter. Rejecting an overflowing page is better than silently
-	// wrapping it to a negative offset. The division form cannot overflow.
-	if int64(page-1) > math.MaxInt64/int64(pageSize) {
-		return ListQuery{}, &domain.ValidationError{Field: "page", Message: "page is too large"}
+	normalized := ListQuery{
+		Status:   q.Status,
+		Assignee: assignee,
+		Cursor:   q.Cursor,
+		PageSize: pageSize,
 	}
 
-	return ListQuery{Status: q.Status, Assignee: assignee, Page: page, PageSize: pageSize}, nil
+	if q.Cursor != "" {
+		afterID, err := DecodeCursor(q.Cursor, normalized)
+		if err != nil {
+			return ListQuery{}, err
+		}
+		normalized.AfterID = afterID
+	}
+
+	return normalized, nil
 }
 
-// Filter is the paginated query the repository executes. Offset is an int64 so
-// a large, validated page number cannot overflow the SQL parameter.
+// Filter is the keyset query the repository executes. AfterID is empty for the
+// first page and otherwise the exclusive lower bound on id.
 type Filter struct {
 	Status   domain.Status
 	Assignee string
 	Limit    int
-	Offset   int64
+	AfterID  string
 }
 
-// TaskPage is one page of repository results plus the total number of matching
-// tasks before pagination.
+// TaskPage is one page of repository results. Totals are not computed: cursor
+// pagination does not need an exact count on every request.
 type TaskPage struct {
 	Tasks []domain.Task
-	Total int64
 }
 
-// ListResult is the complete list response: the page, the total it belongs to,
-// and the pagination metadata the HTTP layer renders.
+// ListResult is the complete list response: the page, whether another page
+// exists, and an opaque cursor to continue when it does.
 type ListResult struct {
 	Tasks      []domain.Task
-	Page       int
 	PageSize   int
-	Total      int64
-	TotalPages int
+	NextCursor string
+	HasMore    bool
 }
 
 // ListSnapshot is the result of a list-cache lookup. Token is an opaque
@@ -204,6 +207,12 @@ func (s *Service) Create(ctx context.Context, in Input) (domain.Task, error) {
 
 // List returns one page of tasks matching query. A cached page is returned
 // without touching PostgreSQL; any cache failure falls back to the database.
+//
+// Pagination is keyset-based on id: the repository fetches one extra row so
+// HasMore and NextCursor can be computed without a COUNT(*). Concurrent
+// inserts, deletes, and updates between requests can still change which rows
+// appear on later pages; the cursor only prevents the classic offset-shift
+// skip/duplicate pattern, not a multi-request snapshot.
 func (s *Service) List(ctx context.Context, query ListQuery) (ListResult, error) {
 	query, err := query.Normalize()
 	if err != nil {
@@ -226,12 +235,13 @@ func (s *Service) List(ctx context.Context, query ListQuery) (ListResult, error)
 		}
 	}
 
-	offset := int64(query.Page-1) * int64(query.PageSize)
+	// Fetch one extra row to learn whether another page exists without a
+	// separate count query.
 	page, err := s.repo.ListPage(ctx, Filter{
 		Status:   query.Status,
 		Assignee: query.Assignee,
-		Limit:    query.PageSize,
-		Offset:   offset,
+		Limit:    query.PageSize + 1,
+		AfterID:  query.AfterID,
 	})
 	if err != nil {
 		return ListResult{}, fmt.Errorf("service: list tasks: %w", err)
@@ -244,12 +254,25 @@ func (s *Service) List(ctx context.Context, query ListQuery) (ListResult, error)
 		tasks = []domain.Task{}
 	}
 
+	hasMore := len(tasks) > query.PageSize
+	if hasMore {
+		tasks = tasks[:query.PageSize]
+	}
+
+	nextCursor := ""
+	if hasMore {
+		encoded, err := EncodeCursor(tasks[len(tasks)-1].ID, query)
+		if err != nil {
+			return ListResult{}, fmt.Errorf("service: list tasks: %w", err)
+		}
+		nextCursor = encoded
+	}
+
 	result := ListResult{
 		Tasks:      tasks,
-		Page:       query.Page,
 		PageSize:   query.PageSize,
-		Total:      page.Total,
-		TotalPages: totalPages(page.Total, query.PageSize),
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
 	}
 
 	if cacheReadable {
@@ -330,15 +353,6 @@ func (s *Service) logCacheError(operation string, err error) {
 		slog.String("operation", operation),
 		slog.Any("error", err),
 	)
-}
-
-// totalPages is the number of pages a filtered result occupies. An empty
-// result has zero pages, which is not the same as an empty page.
-func totalPages(total int64, pageSize int) int {
-	if total == 0 {
-		return 0
-	}
-	return int((total + int64(pageSize) - 1) / int64(pageSize))
 }
 
 // buildTask normalizes input into a validated aggregate. id is empty for

@@ -186,14 +186,14 @@ func TestRunWarmAgainstTestServer(t *testing.T) {
 		hits++
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"items":[],"page":1,"page_size":20,"total":0,"total_pages":0}`))
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":null,"has_more":false,"page_size":20}`))
 	}))
 	defer srv.Close()
 
 	out := &strings.Builder{}
 	err := run(context.Background(), options{
 		baseURL:     srv.URL,
-		query:       "page=1&page_size=20",
+		query:       "page_size=20",
 		requests:    50,
 		concurrency: 4,
 		timeout:     2 * time.Second,
@@ -226,7 +226,7 @@ func TestRunReportsFailedStatusAndFails(t *testing.T) {
 
 	out := &strings.Builder{}
 	err := run(context.Background(), options{
-		baseURL: srv.URL, query: "page=1", requests: 10, concurrency: 2,
+		baseURL: srv.URL, query: "page_size=20", requests: 10, concurrency: 2,
 		timeout: time.Second, mode: modeWarm, redisPrefix: "task-manager",
 	}, out)
 	if !errors.Is(err, errFailedRequests) {
@@ -247,7 +247,7 @@ func TestRunCountsTransportErrors(t *testing.T) {
 
 	out := &strings.Builder{}
 	err := run(context.Background(), options{
-		baseURL: deadURL, query: "page=1", requests: 3, concurrency: 1,
+		baseURL: deadURL, query: "page_size=20", requests: 3, concurrency: 1,
 		timeout: 500 * time.Millisecond, mode: modeWarm, redisPrefix: "task-manager",
 	}, out)
 	if !errors.Is(err, errFailedRequests) {
@@ -267,7 +267,7 @@ func TestRunRequestTimeoutIsCountedAsFailure(t *testing.T) {
 
 	out := &strings.Builder{}
 	err := run(context.Background(), options{
-		baseURL: srv.URL, query: "page=1", requests: 2, concurrency: 1,
+		baseURL: srv.URL, query: "page_size=20", requests: 2, concurrency: 1,
 		timeout: 50 * time.Millisecond, mode: modeWarm, redisPrefix: "task-manager",
 	}, out)
 	if !errors.Is(err, errFailedRequests) {
@@ -313,7 +313,16 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"id": id, "title": body["title"]})
 	case r.Method == http.MethodGet && r.URL.Path == "/tasks":
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"items":[],"page":1,"page_size":1,"total":%d,"total_pages":%d}`, len(f.tasks), len(f.tasks))
+		items := make([]map[string]string, 0, len(f.tasks))
+		for id, title := range f.tasks {
+			items = append(items, map[string]string{"id": id, "title": title})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items":       items,
+			"next_cursor": nil,
+			"has_more":    false,
+			"page_size":   100,
+		})
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/tasks/"):
 		id := strings.TrimPrefix(r.URL.Path, "/tasks/")
 		if _, ok := f.tasks[id]; !ok {
@@ -335,7 +344,7 @@ func TestRunSeedsKnownDatasetAndCleansItUp(t *testing.T) {
 
 	out := &strings.Builder{}
 	err := run(context.Background(), options{
-		baseURL: srv.URL, query: "page=1&page_size=20", requests: 5, concurrency: 2,
+		baseURL: srv.URL, query: "page_size=20", requests: 5, concurrency: 2,
 		timeout: 2 * time.Second, mode: modeWarm, redisPrefix: "task-manager", seed: 3,
 	}, out)
 	if err != nil {
@@ -366,7 +375,7 @@ func TestRunKeepLeavesDatasetAndReportsIt(t *testing.T) {
 
 	out := &strings.Builder{}
 	err := run(context.Background(), options{
-		baseURL: srv.URL, query: "page=1", requests: 2, concurrency: 1,
+		baseURL: srv.URL, query: "page_size=20", requests: 2, concurrency: 1,
 		timeout: 2 * time.Second, mode: modeWarm, redisPrefix: "task-manager", seed: 2, keep: true,
 	}, out)
 	if err != nil {
@@ -393,13 +402,13 @@ func TestRunWarmupFailureAbortsBeforeMeasurement(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"items":[],"page":1,"page_size":20,"total":0,"total_pages":0}`))
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":null,"has_more":false,"page_size":20}`))
 	}))
 	defer srv.Close()
 
 	out := &strings.Builder{}
 	err := run(context.Background(), options{
-		baseURL: srv.URL, query: "page=1", requests: 10, concurrency: 1,
+		baseURL: srv.URL, query: "page_size=20", requests: 10, concurrency: 1,
 		timeout: time.Second, warmup: 3, mode: modeWarm, redisPrefix: "task-manager",
 	}, out)
 	if !errors.Is(err, errFailedRequests) {

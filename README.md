@@ -81,7 +81,7 @@ being unassigned.
 
 The service is intended to run against PostgreSQL. It has no volatile storage
 mode, no automatic database provisioning, and no migration-at-startup behavior.
-Redis caches only `GET /tasks`, one entry per filter/page combination; task
+Redis caches only `GET /tasks`, one entry per filter/cursor/page_size combination; task
 writes always commit to PostgreSQL first. Cache entries expire after a finite
 TTL, and a mutation advances a generation token so every variant is
 invalidated at once and a slow reader cannot republish a pre-mutation page.
@@ -153,7 +153,7 @@ curl -s http://localhost:8080/health
 # {"database":"ok","status":"ok"}
 
 curl -s http://localhost:8080/tasks
-# {"items":[],"page":1,"page_size":20,"total":0,"total_pages":0}
+# {"items":[],"next_cursor":null,"has_more":false,"page_size":20}
 # on a fresh database; this GET creates one cache entry for that query
 
 docker compose exec redis redis-cli --scan --pattern 'task-manager:tasks:list:*'
@@ -442,7 +442,7 @@ Base URL for the examples: `http://localhost:8080`.
 | Method | Path | Purpose | Success | Request body |
 | --- | --- | --- | --- | --- |
 | `POST` | `/task` | Create a task | `201` with the task and a `Location: /tasks/{id}` header | Required |
-| `GET` | `/tasks` | List, filter, and paginate tasks ordered by `id` ascending | `200` with a page envelope, `items: []` when empty | None |
+| `GET` | `/tasks` | List, filter, and cursor-paginate tasks ordered by `id` ascending | `200` with a cursor envelope, `items: []` when empty | None |
 | `GET` | `/tasks/{id}` | Retrieve one task | `200` with the task | None |
 | `PUT` | `/tasks/{id}` | Replace the mutable fields of a task | `200` with the replaced task | Required |
 | `DELETE` | `/tasks/{id}` | Delete a task | `204` with no body | None |
@@ -478,8 +478,8 @@ Additional behavior:
   never created by `PUT`.
 - A malformed `{id}` returns `400 validation_error`; a well-formed UUID that is
   not stored returns `404 not_found`.
-- `GET /tasks` returns one page ordered by `id` ascending. The identifier is
-  unique, so the order is stable across calls and pages never overlap; it is
+- `GET /tasks` returns one cursor page ordered by `id` ascending. The identifier is
+  unique, so for a fixed data set pages never overlap; it is
   not creation order.
 - No authentication, authorization, or sorting controls are implemented.
 
@@ -509,7 +509,8 @@ Content-Type: application/json; charset=utf-8
 
 #### List, filter, and paginate
 
-`GET /tasks` returns a page envelope rather than a bare array:
+`GET /tasks` returns a cursor-paginated envelope (not a bare array, and not
+page-number metadata):
 
 ```json
 {
@@ -522,10 +523,9 @@ Content-Type: application/json; charset=utf-8
       "assignee": "alice"
     }
   ],
-  "page": 2,
-  "page_size": 1,
-  "total": 3,
-  "total_pages": 3
+  "next_cursor": "eyJ2IjoxLCJhZnRlcl9pZCI6IjZiYTdiODEwLTlkYWQtNDFkMS04MGI0LTAwYzA0ZmQ0MzBjOCIsInN0YXR1cyI6ImRvbmUiLCJhc3NpZ25lZSI6ImFsaWNlIiwicGFnZV9zaXplIjoxfQ",
+  "has_more": true,
+  "page_size": 1
 }
 ```
 
@@ -533,28 +533,39 @@ Content-Type: application/json; charset=utf-8
 | --- | --- | --- | --- |
 | `status` | string | *(any)* | Exactly one of `todo`, `in_progress`, `done`. Case-sensitive; any other value is a `400`. |
 | `assignee` | string | *(any)* | Exact, case-sensitive label match. Trimmed; 1–100 characters when present. Omitted returns assigned and unassigned tasks. |
-| `page` | integer | `1` | One-based. Zero, negatives, non-integers, and offsets that would overflow are rejected with `400`. |
+| `cursor` | string | *(first page)* | Opaque token from a previous `next_cursor`. Malformed or filter/page-size-incompatible values are `400` (never silently treated as the first page). |
 | `page_size` | integer | `20` | 1–100. Values above 100 are rejected, not clamped. |
 
 Metadata semantics:
 
 - `items` holds the page's tasks, ordered by `id` ascending. It is always an
-  array, `[]` for an empty or beyond-the-last page.
-- `total` counts every task matching the filters, before pagination. It is the
-  same for every page of one filtered result.
-- `total_pages` is `ceil(total / page_size)`, and `0` when nothing matches.
-- `page` and `page_size` echo the effective values, including defaults.
-- A page beyond the last is valid: it returns `items: []` and the correct
-  `total`/`total_pages`.
-- Unknown query parameters are rejected with `400`, so a typo cannot silently
-  return an unfiltered page.
+  array, `[]` when empty.
+- `has_more` is true when another page exists after this one.
+- `next_cursor` is an opaque continuation token when `has_more` is true, and
+  `null` when the walk is finished. Pass it as `cursor` on the next request
+  with the same filters and `page_size`.
+- `page_size` echoes the effective value, including the default.
+- The cursor is bound to status, assignee, and page size. Changing those while
+  reusing a cursor is a `400`.
+- Unknown query parameters (including the removed `page`) are rejected with
+  `400`, so a typo cannot silently return an unfiltered page.
+- Concurrent writes between pages can change later membership; the cursor
+  avoids offset-shift skips/duplicates but is not a multi-request snapshot.
+  See [ADR 0016](decisions/0016-cursor-pagination-for-task-list.md).
+
+**Migration from page-number pagination:** stop sending `page` and stop reading
+`total` / `total_pages`. Request the first page without `cursor`, then follow
+`next_cursor` until `has_more` is false.
 
 ```bash
 # First page, defaults
 curl -i http://localhost:8080/tasks
 
-# Alice's completed tasks, two per page, second page
-curl -i 'http://localhost:8080/tasks?status=done&assignee=alice&page=2&page_size=2'
+# Alice's completed tasks, first page of size 2
+curl -i 'http://localhost:8080/tasks?status=done&assignee=alice&page_size=2'
+
+# Subsequent page (use next_cursor from the previous response)
+curl -i 'http://localhost:8080/tasks?status=done&assignee=alice&page_size=2&cursor=OPAQUE_CURSOR'
 
 curl -i http://localhost:8080/tasks/6ba7b810-9dad-41d1-80b4-00c04fd430c8
 
@@ -783,7 +794,7 @@ repository knows how to count persisted tasks.
 the `service.ListCache` port, owns the Redis key layout and generation token,
 and handles Redis failures; the service and domain packages never import
 Redis. The cache stores `GET /tasks` pages, one entry per normalized query
-(status, assignee, page, page size) under the current generation. PostgreSQL
+(status, assignee, cursor, page size) under the current generation. PostgreSQL
 remains authoritative, and a cache read, write, or invalidation failure falls
 back to the database.
 
@@ -802,8 +813,8 @@ back to the database.
 | `internal/infra/swagger` | Docs adapter: serves the embedded spec and Swagger UI under `/swagger`; registers only `GET`. |
 | `api` | Embeds `api/openapi.yaml` as `api.OpenAPI`; no business or transport logic. |
 | `internal/task/domain` | `Task`, the closed `Status` set, validation, and UUID identifier format and generation. |
-| `internal/task/service` | Create, list (filtered and paginated), get, update, and delete use cases; normalizes list queries with defaults and bounds, declares the `Repository` and `ListCache` interfaces it consumes, and invalidates every cached page after a committed mutation. |
-| `internal/task/cache/redis` | Cache-aside adapter for task-list pages: one entry per normalized query under the generation token, finite TTL, versioned JSON payload with pagination metadata, malformed-data handling, and fail-open cache failures. |
+| `internal/task/service` | Create, list (filtered and cursor-paginated), get, update, and delete use cases; normalizes list queries and cursors, declares the `Repository` and `ListCache` interfaces it consumes, and invalidates every cached page after a committed mutation. |
+| `internal/task/cache/redis` | Cache-aside adapter for task-list pages: one entry per normalized query (including cursor) under the generation token, finite TTL, versioned JSON payload with cursor metadata, malformed-data handling, and fail-open cache failures. |
 | `internal/task/handler` | Strict request and query decoding, query/path validation, the paginated envelope, response and error mapping; declares the `TaskService` interface it consumes. |
 | `internal/task/repository/postgres` | Explicit SQL CRUD, identifier generation, `sql.ErrNoRows` to `service.ErrNotFound`, parameterized filtering with a matching count, deterministic `id` order, and the `tasks` row count used by metrics. |
 
@@ -1162,9 +1173,9 @@ be a general benchmarking framework. The decision is recorded in
 
 **Dataset preparation**
 
-`-seed 2000` first reads `total` from `GET /tasks?page=1&page_size=1`, creates
+`-seed 2000` first counts tasks by walking `GET /tasks` cursors, creates
 2000 tasks through `POST /task` with a run-unique title
-(`loadtest-<unix-nano>-<n>`, assignee `loadtest`), then re-reads `total` and
+(`loadtest-<unix-nano>-<n>`, assignee `loadtest`), then re-counts via cursors and
 aborts if the count is not `baseline + 2000`. After the measured phase it
 deletes exactly the IDs it created (a `404` is accepted) and reports how many
 were removed. Tasks that already exist are never touched, and a second run does
@@ -1185,7 +1196,7 @@ Mutations are refused against a non-loopback host unless
 # default /0 and from integration tests on /15) so keyspace counters are quiet.
 go run ./cmd/loadtest \
   -base-url http://127.0.0.1:8080 \
-  -query 'page=1&page_size=20' \
+  -query 'page_size=20' \
   -requests 50000 -concurrency 16 -timeout 5s \
   -seed 2000 \
   -redis-url redis://localhost:6379/1
@@ -1193,7 +1204,7 @@ go run ./cmd/loadtest \
 # Cache-miss: every request must reach PostgreSQL.
 go run ./cmd/loadtest \
   -base-url http://127.0.0.1:8080 \
-  -query 'page=1&page_size=20' \
+  -query 'page_size=20' \
   -mode miss -concurrency 1 -requests 1000 -timeout 5s \
   -seed 2000 \
   -redis-url redis://localhost:6379/1
@@ -1218,7 +1229,7 @@ when requests failed or cleanup did not finish, and `2` for invalid options.
 **Measured results**
 
 Measured on 2026-10-21 against a local build of this tree. Dataset: 2000 tasks
-created by the tool, page `1`, `page_size=20`, no filter. Redis list cache
+created by the tool, first page, `page_size=20`, no filter. Redis list cache
 enabled (`REDIS_CACHE_TTL=60s`).
 
 | Scenario | Requests | Concurrency | Throughput | Mean | p50 | p95 | p99 | Max | Failed |
@@ -1336,7 +1347,7 @@ go tool pprof -top ./task-manager heap.pprof
 - Redis traffic crosses the Docker VM boundary on macOS, which inflates warm
   latency relative to a native Redis.
 - Results depend on dataset size, hardware, PostgreSQL configuration, log level,
-  page/page_size, and whether the client is co-located. Re-run the commands on
+  page_size/filters, and whether the client is co-located. Re-run the commands on
   your machine instead of treating these numbers as a general benchmark.
 
 ### Continuous integration
@@ -1447,10 +1458,10 @@ docker build -t task-manager:local .
 | `tasks_count` refreshed on an interval instead of per request | No table scan on the request path; the value reflects PostgreSQL rather than process memory | Eventually consistent up to one interval; stale but timestamped when PostgreSQL is unavailable, and absent before the first success |
 | Request correlation via `X-Request-ID` instead of OpenTelemetry | Cheap, dependency-free log correlation; every response carries the ID | It is not distributed tracing: no spans, sampling, propagation into PostgreSQL, or trace backend |
 | 70% coverage gate on the combined suite | The gate measures the PostgreSQL and Redis adapters as well as unit tests | It requires live test services and a longer CI job |
-| Paginated collection envelope instead of a bare array | One response carries items and trustworthy totals; a page beyond the end is unambiguous | Breaking change for clients that decoded `GET /tasks` as an array; they must read `items` |
+| Cursor-paginated collection envelope | One response carries items plus `next_cursor`/`has_more` without offset-shift skips | Breaking change from page/total metadata; clients must follow `next_cursor` |
 | Exact-match filters with a fixed `id` ordering, no sort parameter | Bounded query shapes, simple parameterized SQL, and an indexable plan | Clients cannot sort or search; ordering is by UUID, not creation time |
-| One cached entry per normalized query under a shared generation | Filtered and paginated reads are cached without collisions, and one mutation invalidates them all | Each distinct filter/page combination occupies its own key until the TTL expires |
-| `count(*)` per cache miss alongside the page query | `total` and `total_pages` are exact for the filtered set | Two queries per miss; the count scans the filtered rows |
+| One cached entry per normalized query under a shared generation | Filtered and cursor-paginated reads are cached without collisions, and one mutation invalidates them all | Each distinct filter/cursor/page_size combination occupies its own key until the TTL expires |
+| Keyset page fetch with `page_size+1` (no `COUNT(*)`) | End-of-list is cheap and exact for the page; no offset math | Clients that need a global total must count locally or use another endpoint later |
 | Small, single-aggregate service | Easy to understand, test, and deploy | No authentication, sorting, search, timestamps, or multi-tenancy |
 
 Intentional scope limits are listed in [Overview](#1-overview). They are not
@@ -1501,8 +1512,8 @@ A few operational constraints are worth repeating:
 | `redis cache disabled` or `redis cache unavailable at startup` in the log | `REDIS_URL` is malformed or Redis is unreachable | The API still serves from PostgreSQL. Correct the URL or start Redis; a restart re-attempts the generation reset |
 | `task list cache failure` warnings on every GET | Redis is down, or invalidation failed earlier and the adapter is degraded | Check Redis health. The process bypasses the cache and serves PostgreSQL. A recovery probe retries every five seconds and a successful mutation invalidates immediately, so caching resumes once Redis answers |
 | `GET /tasks` keeps returning an old list after a write | The mutation failed (so it was not committed), or invalidation failed and was logged | Check the write response and the `task list cache invalidation failed` log. The cache is bypassed after that error; investigate Redis before restarting |
-| `GET /tasks` returns `400` with `invalid query parameters` | An unknown parameter (`staus`), an empty `assignee`, an unsupported `status`, `page` < 1 or non-numeric, or `page_size` outside 1–100 | Send only `status`, `assignee`, `page`, and `page_size` with the documented ranges; the `fields` object names the offending parameter |
-| `total` is larger than the number of `items` returned | Expected: `total` counts every task matching the filters, not just the requested page | Use `page`/`page_size` to walk the result, or `total_pages` to see how many pages exist |
+| `GET /tasks` returns `400` with `invalid query parameters` | An unknown parameter (`staus` or obsolete `page`), an empty `assignee`, an unsupported `status`, a malformed/incompatible `cursor`, or `page_size` outside 1–100 | Send only `status`, `assignee`, `cursor`, and `page_size` with the documented ranges; the `fields` object names the offending parameter |
+| `has_more` is true and `items` has fewer than `page_size` rows | Not expected for a healthy response; `has_more` means another page exists after a full page | Follow `next_cursor` with the same filters and `page_size` until `has_more` is false |
 | Filtering returns nothing for a task that exists | The filter is an exact, case-sensitive match, and the task may be unassigned | Check the stored `assignee` on the task; `assignee` filters cannot select unassigned tasks |
 | Compose starts `app` but the log shows `redis cache unavailable at startup` | Redis was started but not ready, or is down; `app` waits only for the container to start | Expected. The API serves PostgreSQL and the adapter retries every five seconds, so caching resumes without a restart |
 | Every response has an unexpected `X-Request-ID` | A proxy supplied an invalid or oversized header, so the service replaced it | Expected; the response header always contains the final identifier, which also appears in the request log |
@@ -1570,7 +1581,8 @@ as the practical guide for setup, operation, and the current API.
 | [0011. One composition point for HTTP module handlers](decisions/0011-http-handler-composition.md) | Compose HTTP modules through `buildHandlers` returning `server.RouteRegistrar` values; keep lifecycle in the composition root and avoid a plugin framework. | Accepted |
 | [0012. Consumer-owned ports remain the dependency-inversion boundary](decisions/0012-consumer-owned-ports-dependency-audit.md) | Audit the import graph against the dependency rule: ports stay with consumers, adapters and the composition root point inward, and no production code needed to change. | Accepted |
 | [0013. Redis cache-aside for task listing with generation-token invalidation](decisions/0013-redis-cache-aside-for-task-list.md) | Cache `GET /tasks` in Redis with a generation token; invalidate after committed creates, updates, and deletes, and fail open to PostgreSQL when Redis is unavailable. | Accepted |
-| [0014. Task filtering and pagination on a paginated collection envelope](decisions/0014-task-filtering-and-pagination.md) | Add `status`/`assignee` filters and `page`/`page_size` pagination over `id`-ordered SQL, returning `items` plus totals; cache one entry per normalized query under the existing generation. | Accepted |
+| [0014. Task filtering and pagination on a paginated collection envelope](decisions/0014-task-filtering-and-pagination.md) | Add `status`/`assignee` filters and original page-number pagination (later replaced by cursor pagination). | Accepted (pagination superseded by 0016) |
+| [0016. Cursor (keyset) pagination for GET /tasks](decisions/0016-cursor-pagination-for-task-list.md) | Replace `page`/`total`/`total_pages` with opaque keyset cursors bound to filters; update Redis variant keys and drop per-page `COUNT(*)`. | Accepted |
 | [0015. Load testing `GET /tasks` with a small Go runner and opt-in profiling](decisions/0015-load-testing-and-profiling.md) | Measure the list endpoint with a reproducible, self-contained HTTP runner and a loopback-only pprof listener; report measured numbers instead of targets. | Accepted |
 
 No record is superseded or deprecated. ADRs 0003, 0004, and 0007 carry amendment

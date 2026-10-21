@@ -226,9 +226,6 @@ func TestListEmptyReturnsNonNilSlice(t *testing.T) {
 	if len(page.Tasks) != 0 {
 		t.Fatalf("len(tasks) = %d, want 0", len(page.Tasks))
 	}
-	if page.Total != 0 {
-		t.Fatalf("Total = %d, want 0", page.Total)
-	}
 }
 
 func TestListReturnsTasksOrderedByID(t *testing.T) {
@@ -241,8 +238,8 @@ func TestListReturnsTasksOrderedByID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPage() unexpected error: %v", err)
 	}
-	if len(page.Tasks) != 2 || page.Total != 2 {
-		t.Fatalf("page = %+v, want two tasks and a total of 2", page)
+	if len(page.Tasks) != 2 {
+		t.Fatalf("page = %+v, want two tasks", page)
 	}
 
 	ids := []string{page.Tasks[0].ID, page.Tasks[1].ID}
@@ -585,7 +582,7 @@ func TestListFiltersByStatus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListPage(status=%s) unexpected error: %v", status, err)
 		}
-		if page.Total != 1 || len(page.Tasks) != 1 {
+		if len(page.Tasks) != 1 {
 			t.Fatalf("status %s: page = %+v, want exactly one task", status, page)
 		}
 		if page.Tasks[0].Status != status {
@@ -612,7 +609,7 @@ func TestListFiltersByAssignee(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPage() unexpected error: %v", err)
 	}
-	if page.Total != 1 || len(page.Tasks) != 1 || page.Tasks[0].ID != alice.ID {
+	if len(page.Tasks) != 1 || page.Tasks[0].ID != alice.ID {
 		t.Fatalf("page = %+v, want only alice's task", page)
 	}
 }
@@ -629,32 +626,28 @@ func TestListCombinesFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPage() unexpected error: %v", err)
 	}
-	if page.Total != 1 || len(page.Tasks) != 1 || page.Tasks[0].ID != want.ID {
+	if len(page.Tasks) != 1 || page.Tasks[0].ID != want.ID {
 		t.Fatalf("page = %+v, want only alice's done task", page)
 	}
 }
 
-// TestListPaginatesDeterministically proves pages are ordered by id, do not
-// overlap, and each reports the same filtered total.
+// TestListPaginatesDeterministically proves keyset pages are ordered by id and
+// do not overlap for a fixed data set.
 func TestListPaginatesDeterministically(t *testing.T) {
 	repo, _ := newTestRepository(t)
-	created := make(map[string]domain.Task, 5)
 	for _, title := range []string{"one", "two", "three", "four", "five"} {
-		task := mustCreate(t, repo, title)
-		created[task.ID] = task
+		mustCreate(t, repo, title)
 	}
 
 	seen := make(map[string]struct{}, 5)
 	var allIDs []string
+	afterID := ""
 	for pageNumber, wantSize := range []int{2, 2, 1} {
 		page, err := repo.ListPage(context.Background(), service.Filter{
-			Limit: 2, Offset: int64(pageNumber * 2),
+			Limit: 2, AfterID: afterID,
 		})
 		if err != nil {
 			t.Fatalf("ListPage(page %d) unexpected error: %v", pageNumber+1, err)
-		}
-		if page.Total != 5 {
-			t.Fatalf("page %d total = %d, want 5", pageNumber+1, page.Total)
 		}
 		if len(page.Tasks) != wantSize {
 			t.Fatalf("page %d has %d tasks, want %d", pageNumber+1, len(page.Tasks), wantSize)
@@ -666,6 +659,9 @@ func TestListPaginatesDeterministically(t *testing.T) {
 			seen[task.ID] = struct{}{}
 			allIDs = append(allIDs, task.ID)
 		}
+		if len(page.Tasks) > 0 {
+			afterID = page.Tasks[len(page.Tasks)-1].ID
+		}
 	}
 
 	if len(seen) != 5 {
@@ -675,31 +671,160 @@ func TestListPaginatesDeterministically(t *testing.T) {
 		t.Fatalf("IDs = %v, want ascending identifier order across pages", allIDs)
 	}
 
-	last, err := repo.ListPage(context.Background(), service.Filter{Limit: 2, Offset: 4})
+	empty, err := repo.ListPage(context.Background(), service.Filter{Limit: 2, AfterID: afterID})
 	if err != nil {
-		t.Fatalf("ListPage(last page) unexpected error: %v", err)
+		t.Fatalf("ListPage(after last) unexpected error: %v", err)
 	}
-	if len(last.Tasks) != 1 || last.Total != 5 {
-		t.Fatalf("last page = %+v, want one task and total 5", last)
+	if empty.Tasks == nil || len(empty.Tasks) != 0 {
+		t.Fatalf("after last = %+v, want a non-nil empty page", empty)
 	}
 }
 
-func TestListPageBeyondLastKeepsFilteredTotal(t *testing.T) {
+// TestListCursorAvoidsOffsetShift shows why keyset pagination replaces offsets:
+// deleting a prior-page row between requests would make OFFSET skip a live row,
+// while continuing after the last seen id still returns that row.
+func TestListCursorAvoidsOffsetShift(t *testing.T) {
+	repo, db := newTestRepository(t)
+
+	ids := []string{
+		"10000000-0000-4000-8000-000000000001",
+		"10000000-0000-4000-8000-000000000002",
+		"10000000-0000-4000-8000-000000000003",
+		"10000000-0000-4000-8000-000000000004",
+		"10000000-0000-4000-8000-000000000005",
+	}
+	for i, id := range ids {
+		if _, err := db.ExecContext(context.Background(),
+			`INSERT INTO tasks (id, title, description, status, assignee) VALUES ($1::uuid, $2, '', 'todo', NULL)`,
+			id, fmt.Sprintf("task-%d", i+1),
+		); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+
+	first, err := repo.ListPage(context.Background(), service.Filter{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListPage(first): %v", err)
+	}
+	if len(first.Tasks) != 2 || first.Tasks[0].ID != ids[0] || first.Tasks[1].ID != ids[1] {
+		t.Fatalf("first = %+v, want the first two ids", first.Tasks)
+	}
+
+	if _, err := db.ExecContext(context.Background(), `DELETE FROM tasks WHERE id = $1::uuid`, ids[0]); err != nil {
+		t.Fatalf("delete first row: %v", err)
+	}
+
+	cursorPage, err := repo.ListPage(context.Background(), service.Filter{Limit: 2, AfterID: ids[1]})
+	if err != nil {
+		t.Fatalf("ListPage(cursor): %v", err)
+	}
+	if len(cursorPage.Tasks) != 2 || cursorPage.Tasks[0].ID != ids[2] || cursorPage.Tasks[1].ID != ids[3] {
+		t.Fatalf("cursor page = %+v, want ids[2] and ids[3] (no skip)", cursorPage.Tasks)
+	}
+
+	var offsetIDs []string
+	rows, err := db.QueryContext(context.Background(),
+		`SELECT id::text FROM tasks ORDER BY id LIMIT 2 OFFSET 2`)
+	if err != nil {
+		t.Fatalf("offset query: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan offset id: %v", err)
+		}
+		offsetIDs = append(offsetIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("offset rows: %v", err)
+	}
+	if len(offsetIDs) != 2 || offsetIDs[0] != ids[3] {
+		t.Fatalf("offset page = %v, want the classic skip starting at ids[3]", offsetIDs)
+	}
+	if offsetIDs[0] == cursorPage.Tasks[0].ID {
+		t.Fatal("offset and cursor pages unexpectedly agreed after a prior-page delete")
+	}
+}
+
+func TestListInsertBetweenPagesIsVisibleOnLaterPage(t *testing.T) {
+	repo, db := newTestRepository(t)
+	ids := []string{
+		"20000000-0000-4000-8000-000000000001",
+		"20000000-0000-4000-8000-000000000003",
+	}
+	for _, id := range ids {
+		if _, err := db.ExecContext(context.Background(),
+			`INSERT INTO tasks (id, title, description, status, assignee) VALUES ($1::uuid, $2, '', 'todo', NULL)`,
+			id, id,
+		); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+
+	first, err := repo.ListPage(context.Background(), service.Filter{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListPage(first): %v", err)
+	}
+	if len(first.Tasks) != 1 || first.Tasks[0].ID != ids[0] {
+		t.Fatalf("first = %+v, want %s", first.Tasks, ids[0])
+	}
+
+	inserted := "20000000-0000-4000-8000-000000000002"
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO tasks (id, title, description, status, assignee) VALUES ($1::uuid, 'inserted', '', 'todo', NULL)`,
+		inserted,
+	); err != nil {
+		t.Fatalf("insert between: %v", err)
+	}
+
+	second, err := repo.ListPage(context.Background(), service.Filter{Limit: 10, AfterID: first.Tasks[0].ID})
+	if err != nil {
+		t.Fatalf("ListPage(second): %v", err)
+	}
+	got := make([]string, 0, len(second.Tasks))
+	for _, task := range second.Tasks {
+		got = append(got, task.ID)
+	}
+	if len(got) != 2 || got[0] != inserted || got[1] != ids[1] {
+		t.Fatalf("second = %v, want inserted id then the original second row", got)
+	}
+}
+
+func TestListUpdateLeavingFilterIsNotReturned(t *testing.T) {
 	repo, _ := newTestRepository(t)
-	mustCreateWith(t, repo, domain.Task{Title: "todo", Status: domain.StatusTodo})
-	mustCreateWith(t, repo, domain.Task{Title: "done", Status: domain.StatusDone})
+	keep := mustCreateWith(t, repo, domain.Task{Title: "keep", Status: domain.StatusDone, Assignee: "alice"})
+	leave := mustCreateWith(t, repo, domain.Task{Title: "leave", Status: domain.StatusDone, Assignee: "alice"})
 
 	page, err := repo.ListPage(context.Background(), service.Filter{
-		Status: domain.StatusDone, Limit: 2, Offset: 50,
+		Status: domain.StatusDone, Assignee: "alice", Limit: 1,
 	})
 	if err != nil {
-		t.Fatalf("ListPage() unexpected error: %v", err)
+		t.Fatalf("ListPage(first): %v", err)
 	}
-	if page.Total != 1 {
-		t.Fatalf("Total = %d, want the filtered total 1", page.Total)
+	if len(page.Tasks) != 1 {
+		t.Fatalf("first page = %+v, want one task", page.Tasks)
 	}
-	if page.Tasks == nil || len(page.Tasks) != 0 {
-		t.Fatalf("Tasks = %#v, want a non-nil empty page", page.Tasks)
+	afterID := page.Tasks[0].ID
+
+	// Move the other matching row out of the filter between pages.
+	other := leave
+	if afterID == leave.ID {
+		other = keep
+	}
+	other.Status = domain.StatusTodo
+	if _, err := repo.Update(context.Background(), other); err != nil {
+		t.Fatalf("Update(): %v", err)
+	}
+
+	rest, err := repo.ListPage(context.Background(), service.Filter{
+		Status: domain.StatusDone, Assignee: "alice", Limit: 10, AfterID: afterID,
+	})
+	if err != nil {
+		t.Fatalf("ListPage(rest): %v", err)
+	}
+	if len(rest.Tasks) != 0 {
+		t.Fatalf("rest = %+v, want empty after the remaining row left the filter", rest.Tasks)
 	}
 }
 
@@ -715,7 +840,7 @@ func TestListFilterValuesAreBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPage() unexpected error: %v", err)
 	}
-	if page.Total != 0 || len(page.Tasks) != 0 {
+	if len(page.Tasks) != 0 {
 		t.Fatalf("page = %+v, want no matches for a literal assignee", page)
 	}
 }

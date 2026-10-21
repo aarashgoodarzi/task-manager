@@ -60,8 +60,8 @@ func (r *stubRepository) Create(_ context.Context, task domain.Task) (domain.Tas
 	return task, nil
 }
 
-// ListPage mirrors the SQL adapter's contract: filter, order by ID, then slice,
-// with the total counted before pagination.
+// ListPage mirrors the SQL adapter's contract: filter, order by ID, apply the
+// exclusive after-id bound, then limit.
 func (r *stubRepository) ListPage(_ context.Context, filter service.Filter) (service.TaskPage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -74,21 +74,17 @@ func (r *stubRepository) ListPage(_ context.Context, filter service.Filter) (ser
 		if filter.Assignee != "" && task.Assignee != filter.Assignee {
 			continue
 		}
+		if filter.AfterID != "" && task.ID <= filter.AfterID {
+			continue
+		}
 		matched = append(matched, task)
 	}
 	sort.Slice(matched, func(i, j int) bool { return matched[i].ID < matched[j].ID })
 
-	total := int64(len(matched))
-	start := filter.Offset
-	if start > total {
-		start = total
+	if filter.Limit >= 0 && len(matched) > filter.Limit {
+		matched = matched[:filter.Limit]
 	}
-	end := start + int64(filter.Limit)
-	if end > total {
-		end = total
-	}
-
-	return service.TaskPage{Tasks: matched[int(start):int(end)], Total: total}, nil
+	return service.TaskPage{Tasks: matched}, nil
 }
 
 func (r *stubRepository) Get(_ context.Context, id string) (domain.Task, error) {
@@ -319,14 +315,14 @@ func TestListTasksEmpty(t *testing.T) {
 	if page.Items == nil || len(page.Items) != 0 {
 		t.Fatalf("items = %#v, want an empty array", page.Items)
 	}
-	if page.Page != 1 || page.PageSize != service.DefaultPageSize {
-		t.Fatalf("page = %d/%d, want defaults 1/%d", page.Page, page.PageSize, service.DefaultPageSize)
-	}
-	if page.Total != 0 || page.TotalPages != 0 {
-		t.Fatalf("total = %d, pages = %d; want 0/0", page.Total, page.TotalPages)
+	if page.PageSize != service.DefaultPageSize || page.HasMore || page.NextCursor != nil {
+		t.Fatalf("page = %+v, want defaults with no continuation", page)
 	}
 	if strings.Contains(rec.Body.String(), `"items":null`) {
 		t.Fatalf("body = %s, want items encoded as []", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"next_cursor":null`) {
+		t.Fatalf("body = %s, want next_cursor encoded as null", rec.Body.String())
 	}
 }
 
@@ -346,8 +342,8 @@ func TestListTasksPopulated(t *testing.T) {
 	}
 
 	page := decodeList(t, rec)
-	if page.Total != 2 || page.TotalPages != 1 {
-		t.Fatalf("total = %d, pages = %d; want 2/1", page.Total, page.TotalPages)
+	if page.HasMore || page.NextCursor != nil {
+		t.Fatalf("page = %+v, want a complete single page", page)
 	}
 	tasks := page.Items
 	if len(tasks) != 2 {
@@ -525,10 +521,7 @@ func TestListTasksFiltersByStatus(t *testing.T) {
 	createTask(t, router, `{"title":"done one","status":"done"}`)
 
 	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?status=in_progress", ""))
-	if page.Total != 1 || page.TotalPages != 1 {
-		t.Fatalf("total = %d, pages = %d; want 1/1", page.Total, page.TotalPages)
-	}
-	if len(page.Items) != 1 || page.Items[0].Title != "in progress" {
+	if page.HasMore || len(page.Items) != 1 || page.Items[0].Title != "in progress" {
 		t.Fatalf("items = %+v, want only the in_progress task", page.Items)
 	}
 }
@@ -540,10 +533,7 @@ func TestListTasksFiltersByAssignee(t *testing.T) {
 	createTask(t, router, `{"title":"nobody"}`)
 
 	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?assignee=alice", ""))
-	if page.Total != 1 {
-		t.Fatalf("total = %d, want 1", page.Total)
-	}
-	if len(page.Items) != 1 || page.Items[0].Title != "mine" || page.Items[0].Assignee != "alice" {
+	if page.HasMore || len(page.Items) != 1 || page.Items[0].Title != "mine" || page.Items[0].Assignee != "alice" {
 		t.Fatalf("items = %+v, want only alice's task", page.Items)
 	}
 }
@@ -555,7 +545,7 @@ func TestListTasksCombinesFilters(t *testing.T) {
 	createTask(t, router, `{"title":"bob done","assignee":"bob","status":"done"}`)
 
 	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?status=done&assignee=alice", ""))
-	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Title != "alice done" {
+	if page.HasMore || len(page.Items) != 1 || page.Items[0].Title != "alice done" {
 		t.Fatalf("page = %+v, want only alice's done task", page)
 	}
 }
@@ -568,19 +558,31 @@ func TestListTasksPagination(t *testing.T) {
 
 	wantSizes := []int{2, 2, 1}
 	seen := make(map[string]struct{}, 5)
+	cursor := ""
 	for index, wantSize := range wantSizes {
-		pageNumber := index + 1
-		page := decodeList(t, doRequest(router, http.MethodGet,
-			fmt.Sprintf("/tasks?page=%d&page_size=2", pageNumber), ""))
-
-		if page.Page != pageNumber || page.PageSize != 2 {
-			t.Fatalf("page = %d/%d, want %d/2", page.Page, page.PageSize, pageNumber)
+		path := "/tasks?page_size=2"
+		if cursor != "" {
+			path += "&cursor=" + cursor
 		}
-		if page.Total != 5 || page.TotalPages != 3 {
-			t.Fatalf("total = %d, pages = %d; want 5/3", page.Total, page.TotalPages)
+		page := decodeList(t, doRequest(router, http.MethodGet, path, ""))
+
+		if page.PageSize != 2 {
+			t.Fatalf("page_size = %d, want 2", page.PageSize)
+		}
+		wantMore := index < len(wantSizes)-1
+		if page.HasMore != wantMore {
+			t.Fatalf("page %d has_more = %v, want %v", index+1, page.HasMore, wantMore)
+		}
+		if wantMore {
+			if page.NextCursor == nil || *page.NextCursor == "" {
+				t.Fatalf("page %d missing next_cursor", index+1)
+			}
+			cursor = *page.NextCursor
+		} else if page.NextCursor != nil {
+			t.Fatalf("final page next_cursor = %v, want null", page.NextCursor)
 		}
 		if len(page.Items) != wantSize {
-			t.Fatalf("page %d has %d items, want %d", pageNumber, len(page.Items), wantSize)
+			t.Fatalf("page %d has %d items, want %d", index+1, len(page.Items), wantSize)
 		}
 		for _, item := range page.Items {
 			if _, duplicate := seen[item.ID]; duplicate {
@@ -595,19 +597,31 @@ func TestListTasksPagination(t *testing.T) {
 	}
 }
 
-func TestListTasksPageBeyondLastIsEmptyWithTotal(t *testing.T) {
+func TestListTasksRejectsMalformedAndIncompatibleCursor(t *testing.T) {
 	router := newTaskRouter()
-	createTask(t, router, `{"title":"only"}`)
+	createTask(t, router, `{"title":"one"}`)
+	createTask(t, router, `{"title":"two"}`)
 
-	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?page=9&page_size=2", ""))
-	if page.Page != 9 || page.PageSize != 2 {
-		t.Fatalf("page = %d/%d, want the requested 9/2", page.Page, page.PageSize)
+	first := decodeList(t, doRequest(router, http.MethodGet, "/tasks?page_size=1", ""))
+	if first.NextCursor == nil {
+		t.Fatal("expected a continuation cursor")
 	}
-	if page.Total != 1 || page.TotalPages != 1 {
-		t.Fatalf("total = %d, pages = %d; want the filtered total 1/1", page.Total, page.TotalPages)
+
+	malformed := doRequest(router, http.MethodGet, "/tasks?cursor=not-a-cursor", "")
+	if malformed.Code != http.StatusBadRequest {
+		t.Fatalf("malformed status = %d, want 400", malformed.Code)
 	}
-	if page.Items == nil || len(page.Items) != 0 {
-		t.Fatalf("items = %#v, want an empty array", page.Items)
+	if body := decodeError(t, malformed); body.Error.Fields["cursor"] == "" {
+		t.Fatalf("fields = %v, want a cursor entry", body.Error.Fields)
+	}
+
+	incompatible := doRequest(router, http.MethodGet,
+		"/tasks?cursor="+*first.NextCursor+"&page_size=2", "")
+	if incompatible.Code != http.StatusBadRequest {
+		t.Fatalf("incompatible status = %d, want 400", incompatible.Code)
+	}
+	if body := decodeError(t, incompatible); body.Error.Fields["cursor"] == "" {
+		t.Fatalf("fields = %v, want a cursor entry", body.Error.Fields)
 	}
 }
 
@@ -616,8 +630,8 @@ func TestListTasksEmptyFilterResult(t *testing.T) {
 	createTask(t, router, `{"title":"todo","assignee":"alice"}`)
 
 	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?status=done", ""))
-	if page.Total != 0 || page.TotalPages != 0 || len(page.Items) != 0 {
-		t.Fatalf("page = %+v, want an empty result with zero totals", page)
+	if page.HasMore || page.NextCursor != nil || len(page.Items) != 0 {
+		t.Fatalf("page = %+v, want an empty result with no continuation", page)
 	}
 }
 
@@ -660,15 +674,12 @@ func TestListTasksRejectsInvalidQuery(t *testing.T) {
 		{name: "empty status", query: "status=", field: "status"},
 		{name: "empty assignee", query: "assignee=", field: "assignee"},
 		{name: "whitespace assignee", query: "assignee=%20%20", field: "assignee"},
-		{name: "page zero", query: "page=0", field: "page"},
-		{name: "negative page", query: "page=-1", field: "page"},
-		{name: "malformed page", query: "page=abc", field: "page"},
-		{name: "page overflow", query: "page=99999999999999999999", field: "page"},
-		{name: "huge page", query: "page=9223372036854775807", field: "page"},
 		{name: "page size zero", query: "page_size=0", field: "page_size"},
 		{name: "negative page size", query: "page_size=-5", field: "page_size"},
 		{name: "page size above maximum", query: "page_size=101", field: "page_size"},
 		{name: "malformed page size", query: "page_size=ten", field: "page_size"},
+		{name: "malformed cursor", query: "cursor=not-a-cursor", field: "cursor"},
+		{name: "obsolete page parameter", query: "page=1", field: "page"},
 		{name: "unknown parameter", query: "staus=todo", field: "staus"},
 	}
 

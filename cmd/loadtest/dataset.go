@@ -123,37 +123,49 @@ func cleanupTasks(ctx context.Context, client *http.Client, base *url.URL, ids [
 	return deleted, 0, nil
 }
 
-// fetchTotal reads the unfiltered task count through the paginated list
-// endpoint, so dataset bookkeeping also exercises the contract under test.
+// fetchTotal walks the unfiltered cursor-paginated list and counts items, so
+// dataset bookkeeping exercises the same contract under test.
 func fetchTotal(ctx context.Context, client *http.Client, base *url.URL) (int, error) {
-	u := *base
-	u.Path = "/tasks"
-	u.RawQuery = "page=1&page_size=1"
+	total := 0
+	cursor := ""
+	for {
+		u := *base
+		u.Path = "/tasks"
+		q := url.Values{}
+		q.Set("page_size", "100")
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return 0, err
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return 0, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		payload, err := io.ReadAll(io.LimitReader(resp.Body, maxDatasetBody))
+		_ = resp.Body.Close()
+		if err != nil {
+			return 0, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return 0, fmt.Errorf("status %d", resp.StatusCode)
+		}
+		var page struct {
+			Items      []json.RawMessage `json:"items"`
+			NextCursor *string           `json:"next_cursor"`
+			HasMore    bool              `json:"has_more"`
+		}
+		if err := json.Unmarshal(payload, &page); err != nil {
+			return 0, fmt.Errorf("decode list response: %w", err)
+		}
+		total += len(page.Items)
+		if !page.HasMore || page.NextCursor == nil || *page.NextCursor == "" {
+			return total, nil
+		}
+		cursor = *page.NextCursor
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxDatasetBody))
-	if err != nil {
-		return 0, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("status %d", resp.StatusCode)
-	}
-	var page struct {
-		Total *int `json:"total"`
-	}
-	if err := json.Unmarshal(payload, &page); err != nil {
-		return 0, fmt.Errorf("decode list response: %w", err)
-	}
-	if page.Total == nil {
-		return 0, fmt.Errorf("list response has no total")
-	}
-	return *page.Total, nil
 }

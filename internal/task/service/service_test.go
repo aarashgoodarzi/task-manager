@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -67,20 +66,17 @@ func (f *fakeRepo) ListPage(_ context.Context, filter Filter) (TaskPage, error) 
 		if filter.Assignee != "" && task.Assignee != filter.Assignee {
 			continue
 		}
+		if filter.AfterID != "" && task.ID <= filter.AfterID {
+			continue
+		}
 		matched = append(matched, task)
 	}
 	sort.Slice(matched, func(i, j int) bool { return matched[i].ID < matched[j].ID })
 
-	total := int64(len(matched))
-	start := filter.Offset
-	if start > total {
-		start = total
+	if filter.Limit >= 0 && len(matched) > filter.Limit {
+		matched = matched[:filter.Limit]
 	}
-	end := start + int64(filter.Limit)
-	if end > total {
-		end = total
-	}
-	return TaskPage{Tasks: matched[int(start):int(end)], Total: total}, nil
+	return TaskPage{Tasks: matched}, nil
 }
 
 func (f *fakeRepo) Get(_ context.Context, id string) (domain.Task, error) {
@@ -206,7 +202,7 @@ func TestListEmpty(t *testing.T) {
 	if len(result.Tasks) != 0 {
 		t.Fatalf("len(tasks) = %d, want 0", len(result.Tasks))
 	}
-	if result.Page != 1 || result.PageSize != DefaultPageSize || result.Total != 0 || result.TotalPages != 0 {
+	if result.PageSize != DefaultPageSize || result.HasMore || result.NextCursor != "" {
 		t.Fatalf("result = %+v, want the documented empty defaults", result)
 	}
 }
@@ -223,8 +219,8 @@ func TestListPopulated(t *testing.T) {
 	if len(result.Tasks) != 2 {
 		t.Fatalf("len(tasks) = %d, want 2", len(result.Tasks))
 	}
-	if result.Total != 2 || result.TotalPages != 1 {
-		t.Fatalf("result = %+v, want total 2 over one page", result)
+	if result.HasMore || result.NextCursor != "" {
+		t.Fatalf("result = %+v, want a single complete page", result)
 	}
 }
 
@@ -702,94 +698,94 @@ func TestInvalidationSurvivesCanceledRequestContext(t *testing.T) {
 
 func TestListAppliesFiltersBeforePagination(t *testing.T) {
 	repo := newFakeRepo()
-	repo.tasks["id-01"] = domain.Task{ID: "id-01", Title: "todo", Status: domain.StatusTodo, Assignee: "alice"}
-	repo.tasks["id-02"] = domain.Task{ID: "id-02", Title: "done", Status: domain.StatusDone, Assignee: "alice"}
-	repo.tasks["id-03"] = domain.Task{ID: "id-03", Title: "other owner", Status: domain.StatusDone, Assignee: "bob"}
+	repo.tasks["00000000-0000-4000-8000-000000000001"] = domain.Task{
+		ID: "00000000-0000-4000-8000-000000000001", Title: "todo", Status: domain.StatusTodo, Assignee: "alice",
+	}
+	repo.tasks["00000000-0000-4000-8000-000000000002"] = domain.Task{
+		ID: "00000000-0000-4000-8000-000000000002", Title: "done", Status: domain.StatusDone, Assignee: "alice",
+	}
+	repo.tasks["00000000-0000-4000-8000-000000000003"] = domain.Task{
+		ID: "00000000-0000-4000-8000-000000000003", Title: "other owner", Status: domain.StatusDone, Assignee: "bob",
+	}
 
 	result, err := newService(repo).List(context.Background(), ListQuery{
-		Status: domain.StatusDone, Assignee: "alice", Page: 1, PageSize: 1,
+		Status: domain.StatusDone, Assignee: "alice", PageSize: 1,
 	})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
 
-	if want := (Filter{Status: domain.StatusDone, Assignee: "alice", Limit: 1, Offset: 0}); repo.lastFilter != want {
+	// Limit is page_size+1 so HasMore can be detected without COUNT(*).
+	if want := (Filter{Status: domain.StatusDone, Assignee: "alice", Limit: 2}); repo.lastFilter != want {
 		t.Fatalf("repository filter = %+v, want %+v", repo.lastFilter, want)
 	}
-	if result.Total != 1 || len(result.Tasks) != 1 || result.Tasks[0].ID != "id-02" {
+	if result.HasMore || len(result.Tasks) != 1 || result.Tasks[0].ID != "00000000-0000-4000-8000-000000000002" {
 		t.Fatalf("result = %+v, want only the matching done task", result)
 	}
 }
 
-func TestListSecondPageOffset(t *testing.T) {
+func TestListSecondPageUsesCursor(t *testing.T) {
 	repo := newFakeRepo()
-	for i := 1; i <= 3; i++ {
-		id := fmt.Sprintf("id-%02d", i)
+	ids := []string{
+		"00000000-0000-4000-8000-000000000001",
+		"00000000-0000-4000-8000-000000000002",
+		"00000000-0000-4000-8000-000000000003",
+	}
+	for _, id := range ids {
 		repo.tasks[id] = domain.Task{ID: id, Title: id, Status: domain.StatusTodo}
 	}
 
-	result, err := newService(repo).List(context.Background(), ListQuery{Page: 2, PageSize: 2})
+	first, err := newService(repo).List(context.Background(), ListQuery{PageSize: 2})
 	if err != nil {
-		t.Fatalf("List() unexpected error: %v", err)
+		t.Fatalf("List(first) unexpected error: %v", err)
+	}
+	if !first.HasMore || first.NextCursor == "" || len(first.Tasks) != 2 {
+		t.Fatalf("first = %+v, want two tasks and a continuation cursor", first)
 	}
 
-	if repo.lastFilter.Offset != 2 || repo.lastFilter.Limit != 2 {
-		t.Fatalf("filter = %+v, want offset 2 and limit 2", repo.lastFilter)
+	second, err := newService(repo).List(context.Background(), ListQuery{Cursor: first.NextCursor, PageSize: 2})
+	if err != nil {
+		t.Fatalf("List(second) unexpected error: %v", err)
 	}
-	if result.Total != 3 || result.TotalPages != 2 || len(result.Tasks) != 1 || result.Tasks[0].ID != "id-03" {
-		t.Fatalf("result = %+v, want the last task on page 2 of 2", result)
+	if repo.lastFilter.AfterID != ids[1] || repo.lastFilter.Limit != 3 {
+		t.Fatalf("filter = %+v, want after %s and limit 3", repo.lastFilter, ids[1])
+	}
+	if second.HasMore || len(second.Tasks) != 1 || second.Tasks[0].ID != ids[2] {
+		t.Fatalf("second = %+v, want the last task and end of list", second)
 	}
 }
 
-func TestListBeyondLastPageKeepsTotal(t *testing.T) {
+func TestListFinalPageHasNoCursor(t *testing.T) {
 	repo := newFakeRepo()
-	repo.tasks["id-01"] = domain.Task{ID: "id-01", Title: "only", Status: domain.StatusTodo}
+	repo.tasks["00000000-0000-4000-8000-000000000001"] = domain.Task{
+		ID: "00000000-0000-4000-8000-000000000001", Title: "only", Status: domain.StatusTodo,
+	}
 
-	result, err := newService(repo).List(context.Background(), ListQuery{Page: 5, PageSize: 2})
+	result, err := newService(repo).List(context.Background(), ListQuery{PageSize: 2})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-
-	if result.Page != 5 || result.PageSize != 2 {
-		t.Fatalf("page = %d/%d, want the requested 5/2", result.Page, result.PageSize)
+	if result.PageSize != 2 || result.HasMore || result.NextCursor != "" {
+		t.Fatalf("result = %+v, want a final page with no cursor", result)
 	}
-	if result.Total != 1 || result.TotalPages != 1 {
-		t.Fatalf("total = %d, pages = %d; want the filtered 1/1", result.Total, result.TotalPages)
-	}
-	if result.Tasks == nil || len(result.Tasks) != 0 {
-		t.Fatalf("tasks = %#v, want a non-nil empty page", result.Tasks)
+	if len(result.Tasks) != 1 {
+		t.Fatalf("tasks = %#v, want the single task", result.Tasks)
 	}
 }
 
-func TestListTotalPages(t *testing.T) {
-	tests := []struct {
-		total    int
-		pageSize int
-		want     int
-	}{
-		{total: 0, pageSize: 20, want: 0},
-		{total: 1, pageSize: 20, want: 1},
-		{total: 20, pageSize: 20, want: 1},
-		{total: 21, pageSize: 20, want: 2},
-		{total: 100, pageSize: 100, want: 1},
+func TestListHasMoreAcrossPages(t *testing.T) {
+	repo := newFakeRepo()
+	for i := 0; i < 21; i++ {
+		id := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		repo.tasks[id] = domain.Task{ID: id, Title: id, Status: domain.StatusTodo}
 	}
 
-	for _, tc := range tests {
-		t.Run(fmt.Sprintf("%d/%d", tc.total, tc.pageSize), func(t *testing.T) {
-			repo := newFakeRepo()
-			for i := 0; i < tc.total; i++ {
-				id := fmt.Sprintf("id-%04d", i)
-				repo.tasks[id] = domain.Task{ID: id, Title: id, Status: domain.StatusTodo}
-			}
-
-			result, err := newService(repo).List(context.Background(), ListQuery{PageSize: tc.pageSize})
-			if err != nil {
-				t.Fatalf("List() unexpected error: %v", err)
-			}
-			if result.TotalPages != tc.want {
-				t.Fatalf("TotalPages = %d, want %d", result.TotalPages, tc.want)
-			}
-		})
+	result, err := newService(repo).List(context.Background(), ListQuery{PageSize: 20})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if !result.HasMore || result.NextCursor == "" || len(result.Tasks) != 20 {
+		t.Fatalf("result = %+v, want a full page with has_more", result)
 	}
 }
 
@@ -800,12 +796,12 @@ func TestListNormalizesQueryForCache(t *testing.T) {
 	// Trimmed assignee and explicit defaults must reach the cache in their
 	// canonical form, so equivalent requests share one entry.
 	if _, err := New(repo, cache, nil).List(context.Background(), ListQuery{
-		Assignee: "  alice  ", Page: 1, PageSize: DefaultPageSize,
+		Assignee: "  alice  ", PageSize: DefaultPageSize,
 	}); err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
 
-	want := ListQuery{Assignee: "alice", Page: 1, PageSize: DefaultPageSize}
+	want := ListQuery{Assignee: "alice", PageSize: DefaultPageSize}
 	if cache.lastGetQuery != want {
 		t.Fatalf("cache Get query = %+v, want %+v", cache.lastGetQuery, want)
 	}
@@ -820,18 +816,17 @@ func TestListCacheHitReturnsFullMetadata(t *testing.T) {
 
 	cached := ListResult{
 		Tasks:      []domain.Task{{ID: "cached", Title: "from cache", Status: domain.StatusDone}},
-		Page:       2,
 		PageSize:   5,
-		Total:      11,
-		TotalPages: 3,
+		NextCursor: "opaque-next",
+		HasMore:    true,
 	}
 	cache := &fakeCache{snapshot: ListSnapshot{Result: cached, Token: "gen-1", Hit: true}}
 
-	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{Page: 2, PageSize: 5})
+	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{PageSize: 5})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if result.Page != 2 || result.PageSize != 5 || result.Total != 11 || result.TotalPages != 3 {
+	if result.PageSize != 5 || !result.HasMore || result.NextCursor != "opaque-next" {
 		t.Fatalf("result = %+v, want the cached pagination metadata", result)
 	}
 	if repo.listCalls != 0 {
@@ -840,17 +835,22 @@ func TestListCacheHitReturnsFullMetadata(t *testing.T) {
 }
 
 func TestListRejectsInvalidQuery(t *testing.T) {
+	validCursor, err := EncodeCursor("6f1c2a4e-8d3b-4f5a-9c7e-1a2b3c4d5e6f", ListQuery{PageSize: DefaultPageSize})
+	if err != nil {
+		t.Fatalf("EncodeCursor() unexpected error: %v", err)
+	}
+
 	tests := []struct {
 		name  string
 		query ListQuery
 		field string
 	}{
 		{name: "unknown status", query: ListQuery{Status: "pending"}, field: "status"},
-		{name: "negative page", query: ListQuery{Page: -1}, field: "page"},
 		{name: "negative page size", query: ListQuery{PageSize: -1}, field: "page_size"},
 		{name: "page size above maximum", query: ListQuery{PageSize: MaxPageSize + 1}, field: "page_size"},
 		{name: "long assignee", query: ListQuery{Assignee: strings.Repeat("a", domain.MaxAssigneeLength+1)}, field: "assignee"},
-		{name: "overflowing page", query: ListQuery{Page: math.MaxInt64, PageSize: 100}, field: "page"},
+		{name: "malformed cursor", query: ListQuery{Cursor: "not-a-cursor"}, field: "cursor"},
+		{name: "incompatible cursor", query: ListQuery{Cursor: validCursor, PageSize: 10}, field: "cursor"},
 	}
 
 	for _, tc := range tests {

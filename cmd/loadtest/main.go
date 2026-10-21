@@ -75,7 +75,7 @@ func parseFlags(args []string, out io.Writer) (options, error) {
 	fs := flag.NewFlagSet("loadtest", flag.ContinueOnError)
 	fs.SetOutput(out)
 	fs.StringVar(&o.baseURL, "base-url", "http://127.0.0.1:8080", "service base URL")
-	fs.StringVar(&o.query, "query", "page=1&page_size=20", "query string for GET /tasks (leading ? is optional)")
+	fs.StringVar(&o.query, "query", "page_size=20", "query string for GET /tasks (leading ? is optional)")
 	fs.IntVar(&o.requests, "requests", 1000, "measured requests (1..1000000)")
 	fs.IntVar(&o.concurrency, "concurrency", 8, "concurrent workers (1..4096)")
 	fs.DurationVar(&o.timeout, "timeout", 5*time.Second, "per-request timeout")

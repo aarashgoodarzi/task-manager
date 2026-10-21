@@ -71,7 +71,8 @@ failure samples contain only the status code or transport error text.
 tool also exercises the write contract and invalidates the cache the way real
 traffic would. Each run:
 
-1. reads `total` from `GET /tasks?page=1&page_size=1`;
+1. counts existing tasks by walking `GET /tasks` with cursor pagination
+   ([ADR 0016](0016-cursor-pagination-for-task-list.md));
 2. creates `N` tasks with a run-unique title prefix (`loadtest-<unix-nano>-`) and
    assignee `loadtest`;
 3. re-reads `total` and aborts unless it is `baseline + N`;

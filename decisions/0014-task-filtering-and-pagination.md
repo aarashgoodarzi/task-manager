@@ -1,6 +1,7 @@
 # 0014. Task filtering and pagination on a paginated collection envelope
 
-* Status: Accepted
+* Status: Accepted (page-number pagination superseded by
+  [0016](0016-cursor-pagination-for-task-list.md))
 * Date: 2026-10-21
 * Scope: `internal/task/**`, `internal/infra/database/migrations/`,
   `internal/infra/database/schema.go`, `api/openapi.yaml`, README
@@ -8,7 +9,9 @@
   contract; [0006](0006-postgres-task-persistence.md) — versioned migrations
   and explicit SQL; [0012](0012-consumer-owned-ports-dependency-audit.md) —
   consumer-owned ports; [0013](0013-redis-cache-aside-for-task-list.md) — the
-  list cache this decision extends.
+  list cache this decision extends;
+  [0016](0016-cursor-pagination-for-task-list.md) — replaces `page` /
+  `total` / `total_pages` with opaque cursor pagination.
 
 ## Context
 

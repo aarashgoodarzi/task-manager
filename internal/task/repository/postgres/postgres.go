@@ -69,12 +69,11 @@ func (r *Repository) Create(ctx context.Context, task domain.Task) (domain.Task,
 	return domain.Task{}, fmt.Errorf("postgres: could not generate a unique task id in %d attempts", maxIDAttempts)
 }
 
-// ListPage returns one page of tasks matching filter, ordered by identifier,
-// together with the total number of matching tasks before pagination.
-//
-// Filtering, ordering, and pagination all happen in PostgreSQL: the adapter
-// never loads the collection to slice it in memory. The count and the page use
-// the same WHERE clause builder, so their semantics cannot drift apart.
+// ListPage returns one page of tasks matching filter, ordered by identifier
+// ascending. When AfterID is set, only rows with id greater than that bound
+// are returned (keyset pagination). Filtering, ordering, and the limit all
+// happen in PostgreSQL: the adapter never loads the collection to slice it in
+// memory.
 func (r *Repository) ListPage(ctx context.Context, filter service.Filter) (service.TaskPage, error) {
 	if r.db == nil {
 		return service.TaskPage{}, fmt.Errorf("postgres: list tasks: nil pool")
@@ -82,20 +81,15 @@ func (r *Repository) ListPage(ctx context.Context, filter service.Filter) (servi
 
 	where, args := filterClause(filter)
 
-	var total int64
-	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM tasks`+where, args...).Scan(&total); err != nil {
-		return service.TaskPage{}, fmt.Errorf("postgres: count tasks: %w", err)
-	}
-
-	// LIMIT and OFFSET are bound as parameters, like every other value in this
-	// adapter, so no user input is ever interpolated into SQL.
-	pageArgs := make([]any, 0, len(args)+2)
+	// LIMIT is bound as a parameter, like every other value in this adapter,
+	// so no user input is ever interpolated into SQL.
+	pageArgs := make([]any, 0, len(args)+1)
 	pageArgs = append(pageArgs, args...)
-	pageArgs = append(pageArgs, filter.Limit, filter.Offset)
+	pageArgs = append(pageArgs, filter.Limit)
 
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT `+selectColumns+` FROM tasks`+where+
-			fmt.Sprintf(` ORDER BY id LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2),
+			fmt.Sprintf(` ORDER BY id LIMIT $%d`, len(args)+1),
 		pageArgs...)
 	if err != nil {
 		return service.TaskPage{}, fmt.Errorf("postgres: list tasks: %w", err)
@@ -114,15 +108,15 @@ func (r *Repository) ListPage(ctx context.Context, filter service.Filter) (servi
 		return service.TaskPage{}, fmt.Errorf("postgres: list tasks: %w", err)
 	}
 
-	return service.TaskPage{Tasks: tasks, Total: total}, nil
+	return service.TaskPage{Tasks: tasks}, nil
 }
 
-// filterClause builds the shared WHERE clause for the count and page queries.
-// Values are always bound as parameters; the placeholder numbers follow the
-// argument order so the two queries cannot disagree about which value is which.
+// filterClause builds the WHERE clause for status, assignee, and optional
+// keyset bound. Values are always bound as parameters; the placeholder numbers
+// follow the argument order.
 func filterClause(filter service.Filter) (string, []any) {
-	conditions := make([]string, 0, 2)
-	args := make([]any, 0, 2)
+	conditions := make([]string, 0, 3)
+	args := make([]any, 0, 3)
 
 	if filter.Status != "" {
 		args = append(args, string(filter.Status))
@@ -131,6 +125,10 @@ func filterClause(filter service.Filter) (string, []any) {
 	if filter.Assignee != "" {
 		args = append(args, filter.Assignee)
 		conditions = append(conditions, fmt.Sprintf("assignee = $%d", len(args)))
+	}
+	if filter.AfterID != "" {
+		args = append(args, filter.AfterID)
+		conditions = append(conditions, fmt.Sprintf("id > $%d::uuid", len(args)))
 	}
 	if len(conditions) == 0 {
 		return "", args

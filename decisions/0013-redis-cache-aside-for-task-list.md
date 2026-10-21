@@ -73,9 +73,10 @@ disables the feature without changing use-case behavior.
 | `task-manager:tasks:list:<token>:<variant>` | JSON page envelope (schema version 2) | `REDIS_CACHE_TTL`, default `60s` |
 
 `<variant>` is an 8-byte hex fingerprint of the normalized query
-(`status`, `assignee`, `page`, `page_size`). Equivalent requests share one
-entry; a mutation advances the generation so every variant becomes unreachable
-together ([ADR 0014](0014-task-filtering-and-pagination.md)).
+(`status`, `assignee`, `cursor`, `page_size`; see
+[ADR 0016](0016-cursor-pagination-for-task-list.md)). Equivalent requests share
+one entry; a mutation advances the generation so every variant becomes
+unreachable together.
 
 - The generation token is initialized with `SET NX` on the first read, so
   concurrent first readers converge on one token without a lock.
@@ -85,10 +86,11 @@ together ([ADR 0014](0014-task-filtering-and-pagination.md)).
   unparsable values fall back to `60s`; the adapter rejects non-positive TTLs.
 - An empty page is stored with `"tasks":[]` (and pagination metadata) and is a
   valid hit. It is never treated as a miss or as `null`.
-- Schema version **2** carries `page`, `page_size`, `total`, and `total_pages`
-  alongside `tasks`. Version-1 payloads and corrupt JSON are treated as misses
-  after a compare-and-delete of the exact bytes observed, so a concurrent valid
-  refill is not removed and the service can repopulate immediately.
+- Schema version **3** carries `page_size`, `next_cursor`, and `has_more`
+  alongside `tasks` ([ADR 0016](0016-cursor-pagination-for-task-list.md)).
+  Older versions and corrupt JSON are treated as misses after a
+  compare-and-delete of the exact bytes observed, so a concurrent valid refill
+  is not removed and the service can repopulate immediately.
 
 ### Mutation invalidation
 

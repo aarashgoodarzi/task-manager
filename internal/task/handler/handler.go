@@ -68,14 +68,13 @@ type taskResponse struct {
 	Assignee    string        `json:"assignee"`
 }
 
-// taskListResponse is the paginated collection envelope. The metadata comes
-// from the same filtered set as the items, so page and total cannot disagree.
+// taskListResponse is the cursor-paginated collection envelope. next_cursor is
+// null when has_more is false so clients can stop without inspecting items.
 type taskListResponse struct {
 	Items      []taskResponse `json:"items"`
-	Page       int            `json:"page"`
+	NextCursor *string        `json:"next_cursor"`
+	HasMore    bool           `json:"has_more"`
 	PageSize   int            `json:"page_size"`
-	Total      int64          `json:"total"`
-	TotalPages int            `json:"total_pages"`
 }
 
 func toResponse(task domain.Task) taskResponse {
@@ -125,12 +124,15 @@ func (h *Handler) list(c *gin.Context) {
 	for _, task := range result.Tasks {
 		items = append(items, toResponse(task))
 	}
+	var nextCursor *string
+	if result.NextCursor != "" {
+		nextCursor = &result.NextCursor
+	}
 	c.JSON(http.StatusOK, taskListResponse{
 		Items:      items,
-		Page:       result.Page,
+		NextCursor: nextCursor,
+		HasMore:    result.HasMore,
 		PageSize:   result.PageSize,
-		Total:      result.Total,
-		TotalPages: result.TotalPages,
 	})
 }
 
@@ -190,14 +192,14 @@ func (h *Handler) delete(c *gin.Context) {
 var listQueryParams = map[string]struct{}{
 	"status":    {},
 	"assignee":  {},
-	"page":      {},
+	"cursor":    {},
 	"page_size": {},
 }
 
 // decodeListQuery parses and validates the collection query string. It writes
 // the error envelope itself and reports whether the request may continue.
-// Range rules (page >= 1, page_size <= MaxPageSize, assignee length, overflow)
-// live in the use case and are reported with the same envelope.
+// Range rules (page_size bounds, assignee length, cursor shape and
+// compatibility) live in the use case and are reported with the same envelope.
 func decodeListQuery(c *gin.Context) (service.ListQuery, bool) {
 	values := c.Request.URL.Query()
 	fields := make(map[string]string)
@@ -231,18 +233,10 @@ func decodeListQuery(c *gin.Context) (service.ListQuery, bool) {
 		}
 	}
 
-	if values.Has("page") {
-		page, err := strconv.Atoi(values.Get("page"))
-		switch {
-		case err != nil:
-			fields["page"] = "must be a whole number"
-		case page < 1:
-			// An explicit zero is a client error; only an omitted page uses
-			// the default, so the two cases cannot be confused.
-			fields["page"] = "must be at least 1"
-		default:
-			query.Page = page
-		}
+	if values.Has("cursor") {
+		// An omitted cursor means the first page. An explicitly empty value is
+		// the same; a non-empty value is decoded and bound in Normalize.
+		query.Cursor = values.Get("cursor")
 	}
 
 	if values.Has("page_size") {

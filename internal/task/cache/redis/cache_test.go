@@ -131,13 +131,13 @@ func newTestCache(store store, ttl time.Duration, tokens ...string) *Cache {
 // defaultQuery is the query the service produces for a request with no
 // parameters, which most tests exercise.
 func defaultQuery() service.ListQuery {
-	return service.ListQuery{Page: 1, PageSize: service.DefaultPageSize}
+	return service.ListQuery{PageSize: service.DefaultPageSize}
 }
 
 // samePage compares two cached pages field by field; ListResult holds a slice
 // and is therefore not comparable.
 func samePage(a, b service.ListResult) bool {
-	if a.Page != b.Page || a.PageSize != b.PageSize || a.Total != b.Total || a.TotalPages != b.TotalPages {
+	if a.PageSize != b.PageSize || a.NextCursor != b.NextCursor || a.HasMore != b.HasMore {
 		return false
 	}
 	if len(a.Tasks) != len(b.Tasks) {
@@ -153,11 +153,8 @@ func samePage(a, b service.ListResult) bool {
 
 func pageOf(tasks ...domain.Task) service.ListResult {
 	return service.ListResult{
-		Tasks:      tasks,
-		Page:       1,
-		PageSize:   service.DefaultPageSize,
-		Total:      int64(len(tasks)),
-		TotalPages: 1,
+		Tasks:    tasks,
+		PageSize: service.DefaultPageSize,
 	}
 }
 
@@ -217,7 +214,7 @@ func TestGetHitRoundTrip(t *testing.T) {
 		{ID: "id-1", Title: "first", Description: "one", Status: domain.StatusTodo, Assignee: "alice"},
 		{ID: "id-2", Title: "second", Description: "", Status: domain.StatusDone},
 	}
-	result := service.ListResult{Tasks: tasks, Page: 1, PageSize: 20, Total: 2, TotalPages: 1}
+	result := service.ListResult{Tasks: tasks, PageSize: 20}
 	if err := cache.Set(context.Background(), query, service.ListSnapshot{Result: result, Token: miss.Token}); err != nil {
 		t.Fatalf("Set() unexpected error: %v", err)
 	}
@@ -249,7 +246,7 @@ func TestGetHitEmptyPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
-	result := service.ListResult{Tasks: []domain.Task{}, Page: 2, PageSize: 10, Total: 4, TotalPages: 1}
+	result := service.ListResult{Tasks: []domain.Task{}, PageSize: 10, NextCursor: "next", HasMore: true}
 	if err := cache.Set(context.Background(), query, service.ListSnapshot{Result: result, Token: miss.Token}); err != nil {
 		t.Fatalf("Set() unexpected error: %v", err)
 	}
@@ -264,8 +261,8 @@ func TestGetHitEmptyPage(t *testing.T) {
 	if hit.Result.Tasks == nil || len(hit.Result.Tasks) != 0 {
 		t.Fatalf("tasks = %#v, want a non-nil empty page", hit.Result.Tasks)
 	}
-	if hit.Result.Total != 4 || hit.Result.TotalPages != 1 {
-		t.Fatalf("result = %+v, want the cached total metadata", hit.Result)
+	if hit.Result.PageSize != 10 || !hit.Result.HasMore || hit.Result.NextCursor != "next" {
+		t.Fatalf("result = %+v, want the cached cursor metadata", hit.Result)
 	}
 }
 
@@ -354,12 +351,9 @@ func TestGetInvalidPayloadDoesNotDeleteConcurrentReplacement(t *testing.T) {
 	store.values[key] = poison
 
 	valid, err := json.Marshal(cachedList{
-		Version:    cacheSchemaVersion,
-		Tasks:      []domain.Task{{ID: "id-1", Title: "fresh", Status: domain.StatusTodo}},
-		Page:       1,
-		PageSize:   service.DefaultPageSize,
-		Total:      1,
-		TotalPages: 1,
+		Version:  cacheSchemaVersion,
+		Tasks:    []domain.Task{{ID: "id-1", Title: "fresh", Status: domain.StatusTodo}},
+		PageSize: service.DefaultPageSize,
 	})
 	if err != nil {
 		t.Fatalf("marshal valid payload: %v", err)
@@ -453,7 +447,7 @@ func TestSetUsesConfiguredTTLAndKeyLayout(t *testing.T) {
 	if payload.Version != cacheSchemaVersion || len(payload.Tasks) != 1 {
 		t.Fatalf("payload = %+v, want version %d with one task", payload, cacheSchemaVersion)
 	}
-	if payload.Page != 1 || payload.PageSize != service.DefaultPageSize || payload.Total != 1 || payload.TotalPages != 1 {
+	if payload.PageSize != service.DefaultPageSize || payload.HasMore || payload.NextCursor != "" {
 		t.Fatalf("payload = %+v, want the pagination metadata", payload)
 	}
 }
@@ -465,13 +459,13 @@ func TestVariantKeysAreDistinct(t *testing.T) {
 
 	queries := map[string]service.ListQuery{
 		"base":           base,
-		"status todo":    {Status: domain.StatusTodo, Page: 1, PageSize: 20},
-		"status done":    {Status: domain.StatusDone, Page: 1, PageSize: 20},
-		"assignee alice": {Assignee: "alice", Page: 1, PageSize: 20},
-		"assignee bob":   {Assignee: "bob", Page: 1, PageSize: 20},
-		"page 2":         {Page: 2, PageSize: 20},
-		"page size 10":   {Page: 1, PageSize: 10},
-		"both filters":   {Status: domain.StatusDone, Assignee: "alice", Page: 1, PageSize: 20},
+		"status todo":    {Status: domain.StatusTodo, PageSize: 20},
+		"status done":    {Status: domain.StatusDone, PageSize: 20},
+		"assignee alice": {Assignee: "alice", PageSize: 20},
+		"assignee bob":   {Assignee: "bob", PageSize: 20},
+		"page 2":         {Cursor: "cursor-page-2", PageSize: 20},
+		"page size 10":   {PageSize: 10},
+		"both filters":   {Status: domain.StatusDone, Assignee: "alice", PageSize: 20},
 	}
 
 	seen := make(map[string]string, len(queries))
@@ -490,7 +484,7 @@ func TestVariantKeyIsStableForEquivalentQueries(t *testing.T) {
 	cache := newTestCache(newFakeStore(), time.Minute, "gen-a")
 
 	defaultKey := cache.listKey("gen-a", defaultQuery())
-	explicitKey := cache.listKey("gen-a", service.ListQuery{Page: 1, PageSize: service.DefaultPageSize})
+	explicitKey := cache.listKey("gen-a", service.ListQuery{PageSize: service.DefaultPageSize})
 	if defaultKey != explicitKey {
 		t.Fatalf("keys differ for equivalent queries: %q vs %q", defaultKey, explicitKey)
 	}
@@ -501,8 +495,8 @@ func TestVariantsAreIndependent(t *testing.T) {
 	cache := newTestCache(store, time.Minute, "gen-a")
 	ctx := context.Background()
 
-	aliceQuery := service.ListQuery{Assignee: "alice", Page: 1, PageSize: 20}
-	bobQuery := service.ListQuery{Assignee: "bob", Page: 1, PageSize: 20}
+	aliceQuery := service.ListQuery{Assignee: "alice", PageSize: 20}
+	bobQuery := service.ListQuery{Assignee: "bob", PageSize: 20}
 
 	miss, err := cache.Get(ctx, aliceQuery)
 	if err != nil {
@@ -510,8 +504,8 @@ func TestVariantsAreIndependent(t *testing.T) {
 	}
 	if err := cache.Set(ctx, aliceQuery, service.ListSnapshot{
 		Result: service.ListResult{
-			Tasks: []domain.Task{{ID: "alice-task", Title: "alice", Assignee: "alice", Status: domain.StatusTodo}},
-			Page:  1, PageSize: 20, Total: 1, TotalPages: 1,
+			Tasks:    []domain.Task{{ID: "alice-task", Title: "alice", Assignee: "alice", Status: domain.StatusTodo}},
+			PageSize: 20,
 		},
 		Token: miss.Token,
 	}); err != nil {
@@ -546,9 +540,9 @@ func TestInvalidationHidesEveryVariant(t *testing.T) {
 	ctx := context.Background()
 
 	queries := []service.ListQuery{
-		{Page: 1, PageSize: 20},
-		{Status: domain.StatusDone, Page: 1, PageSize: 20},
-		{Assignee: "alice", Page: 2, PageSize: 5},
+		{PageSize: 20},
+		{Status: domain.StatusDone, PageSize: 20},
+		{Assignee: "alice", Cursor: "cursor-alice-2", PageSize: 5},
 	}
 
 	for _, query := range queries {

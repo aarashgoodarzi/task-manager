@@ -28,10 +28,10 @@ const (
 	defaultKeyPrefix = "task-manager"
 
 	// cacheSchemaVersion versions the cached payload. A payload with another
-	// version is treated as a miss, not decoded speculatively. Version 2 added
-	// the pagination metadata, so version-1 entries are ignored rather than
-	// decoded with missing fields.
-	cacheSchemaVersion = 2
+	// version is treated as a miss, not decoded speculatively. Version 3
+	// replaced page/total/total_pages with cursor pagination metadata, so
+	// older entries are ignored rather than decoded with missing fields.
+	cacheSchemaVersion = 3
 
 	// generationReadAttempts bounds the initialize-on-first-read loop when
 	// several readers race to create the generation key.
@@ -231,10 +231,9 @@ func (c *Cache) Get(ctx context.Context, query service.ListQuery) (service.ListS
 	return service.ListSnapshot{
 		Result: service.ListResult{
 			Tasks:      tasks,
-			Page:       payload.Page,
 			PageSize:   payload.PageSize,
-			Total:      payload.Total,
-			TotalPages: payload.TotalPages,
+			NextCursor: payload.NextCursor,
+			HasMore:    payload.HasMore,
 		},
 		Token: token,
 		Hit:   true,
@@ -263,10 +262,9 @@ func (c *Cache) Set(ctx context.Context, query service.ListQuery, snapshot servi
 	payload, err := json.Marshal(cachedList{
 		Version:    cacheSchemaVersion,
 		Tasks:      snapshot.Result.Tasks,
-		Page:       snapshot.Result.Page,
 		PageSize:   snapshot.Result.PageSize,
-		Total:      snapshot.Result.Total,
-		TotalPages: snapshot.Result.TotalPages,
+		NextCursor: snapshot.Result.NextCursor,
+		HasMore:    snapshot.Result.HasMore,
 	})
 	if err != nil {
 		return fmt.Errorf("redis cache: encode list: %w", err)
@@ -352,8 +350,8 @@ func (c *Cache) listKey(token string, query service.ListQuery) string {
 // hashed rather than concatenated so no assignee value can mimic another
 // field's delimiter, and the stored keys stay a fixed length.
 func variantKey(query service.ListQuery) string {
-	canonical := fmt.Sprintf("status=%s\x00assignee=%s\x00page=%d\x00page_size=%d",
-		query.Status, query.Assignee, query.Page, query.PageSize)
+	canonical := fmt.Sprintf("status=%s\x00assignee=%s\x00cursor=%s\x00page_size=%d",
+		query.Status, query.Assignee, query.Cursor, query.PageSize)
 	sum := sha256.Sum256([]byte(canonical))
 	return hex.EncodeToString(sum[:8])
 }
@@ -394,10 +392,9 @@ func (c *Cache) currentToken(ctx context.Context) (string, error) {
 type cachedList struct {
 	Version    int           `json:"version"`
 	Tasks      []domain.Task `json:"tasks"`
-	Page       int           `json:"page"`
 	PageSize   int           `json:"page_size"`
-	Total      int64         `json:"total"`
-	TotalPages int           `json:"total_pages"`
+	NextCursor string        `json:"next_cursor"`
+	HasMore    bool          `json:"has_more"`
 }
 
 // newGenerationToken returns 128 random bits as lowercase hex. The value is a

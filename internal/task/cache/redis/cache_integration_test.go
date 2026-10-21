@@ -66,18 +66,14 @@ func cleanupRedisKeys(t *testing.T, url, prefix string) {
 	}
 }
 
-func listPage(tasks []domain.Task, total int64, page, pageSize int) service.ListResult {
-	pages := 0
-	if total > 0 {
-		pages = int((total + int64(pageSize) - 1) / int64(pageSize))
-	}
-	return service.ListResult{Tasks: tasks, Page: page, PageSize: pageSize, Total: total, TotalPages: pages}
+func listPage(tasks []domain.Task, pageSize int, nextCursor string, hasMore bool) service.ListResult {
+	return service.ListResult{Tasks: tasks, PageSize: pageSize, NextCursor: nextCursor, HasMore: hasMore}
 }
 
 func TestRedisCacheMissThenHit(t *testing.T) {
 	cache := newIntegrationCache(t, time.Minute)
 	ctx := context.Background()
-	query := service.ListQuery{Page: 1, PageSize: 20}
+	query := service.ListQuery{PageSize: 20}
 
 	miss, err := cache.Get(ctx, query)
 	if err != nil {
@@ -91,7 +87,7 @@ func TestRedisCacheMissThenHit(t *testing.T) {
 		{ID: "id-1", Title: "first", Description: "one", Status: domain.StatusTodo, Assignee: "alice"},
 		{ID: "id-2", Title: "second", Status: domain.StatusDone},
 	}
-	result := listPage(tasks, 2, 1, 20)
+	result := listPage(tasks, 20, "", false)
 	if err := cache.Set(ctx, query, service.ListSnapshot{Result: result, Token: miss.Token}); err != nil {
 		t.Fatalf("Set(): %v", err)
 	}
@@ -111,14 +107,14 @@ func TestRedisCacheMissThenHit(t *testing.T) {
 func TestRedisCacheEmptyPageIsAHit(t *testing.T) {
 	cache := newIntegrationCache(t, time.Minute)
 	ctx := context.Background()
-	query := service.ListQuery{Page: 4, PageSize: 5}
+	query := service.ListQuery{Cursor: "cursor-page-4", PageSize: 5}
 
 	miss, err := cache.Get(ctx, query)
 	if err != nil {
 		t.Fatalf("Get() miss: %v", err)
 	}
 	if err := cache.Set(ctx, query, service.ListSnapshot{
-		Result: listPage([]domain.Task{}, 3, 4, 5), Token: miss.Token,
+		Result: listPage([]domain.Task{}, 5, "next", true), Token: miss.Token,
 	}); err != nil {
 		t.Fatalf("Set(): %v", err)
 	}
@@ -133,22 +129,22 @@ func TestRedisCacheEmptyPageIsAHit(t *testing.T) {
 	if hit.Result.Tasks == nil || len(hit.Result.Tasks) != 0 {
 		t.Fatalf("tasks = %#v, want a non-nil empty page", hit.Result.Tasks)
 	}
-	if hit.Result.Total != 3 || hit.Result.Page != 4 {
-		t.Fatalf("result = %+v, want the cached metadata", hit.Result)
+	if hit.Result.PageSize != 5 || !hit.Result.HasMore || hit.Result.NextCursor != "next" {
+		t.Fatalf("result = %+v, want the cached cursor metadata", hit.Result)
 	}
 }
 
 func TestRedisCacheExpires(t *testing.T) {
 	cache := newIntegrationCache(t, 100*time.Millisecond)
 	ctx := context.Background()
-	query := service.ListQuery{Page: 1, PageSize: 20}
+	query := service.ListQuery{PageSize: 20}
 
 	miss, err := cache.Get(ctx, query)
 	if err != nil {
 		t.Fatalf("Get() miss: %v", err)
 	}
 	if err := cache.Set(ctx, query, service.ListSnapshot{
-		Result: listPage([]domain.Task{{ID: "id-1", Title: "expiring", Status: domain.StatusTodo}}, 1, 1, 20),
+		Result: listPage([]domain.Task{{ID: "id-1", Title: "expiring", Status: domain.StatusTodo}}, 20, "", false),
 		Token:  miss.Token,
 	}); err != nil {
 		t.Fatalf("Set(): %v", err)
@@ -177,8 +173,8 @@ func TestRedisCacheVariantsAreIsolated(t *testing.T) {
 	cache := newIntegrationCache(t, time.Minute)
 	ctx := context.Background()
 
-	aliceQuery := service.ListQuery{Assignee: "alice", Page: 1, PageSize: 20}
-	bobQuery := service.ListQuery{Assignee: "bob", Page: 1, PageSize: 20}
+	aliceQuery := service.ListQuery{Assignee: "alice", PageSize: 20}
+	bobQuery := service.ListQuery{Assignee: "bob", PageSize: 20}
 
 	aliceTasks := []domain.Task{{ID: "a-1", Title: "alice", Assignee: "alice", Status: domain.StatusTodo}}
 	bobTasks := []domain.Task{
@@ -195,7 +191,7 @@ func TestRedisCacheVariantsAreIsolated(t *testing.T) {
 			t.Fatalf("Get(%+v) miss: %v", query, err)
 		}
 		if err := cache.Set(ctx, query, service.ListSnapshot{
-			Result: listPage(tasks, int64(len(tasks)), 1, 20), Token: miss.Token,
+			Result: listPage(tasks, 20, "", false), Token: miss.Token,
 		}); err != nil {
 			t.Fatalf("Set(%+v): %v", query, err)
 		}
@@ -213,17 +209,17 @@ func TestRedisCacheVariantsAreIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(bob): %v", err)
 	}
-	if !bobHit.Hit || bobHit.Result.Total != 2 || bobHit.Result.Tasks[0].ID != "b-1" {
+	if !bobHit.Hit || len(bobHit.Result.Tasks) != 2 || bobHit.Result.Tasks[0].ID != "b-1" {
 		t.Fatalf("bob page = %+v, want bob's two tasks", bobHit.Result)
 	}
 
-	// A page variant of the same filter must not reuse page 1's entry.
-	pageTwo, err := cache.Get(ctx, service.ListQuery{Assignee: "bob", Page: 2, PageSize: 1})
+	// A cursor variant of the same filter must not reuse the first-page entry.
+	pageTwo, err := cache.Get(ctx, service.ListQuery{Assignee: "bob", Cursor: "cursor-bob-2", PageSize: 1})
 	if err != nil {
-		t.Fatalf("Get(page 2): %v", err)
+		t.Fatalf("Get(cursor page): %v", err)
 	}
 	if pageTwo.Hit {
-		t.Fatal("page 2 hit page 1's cached entry")
+		t.Fatal("cursor page hit the first page's cached entry")
 	}
 }
 
@@ -232,9 +228,9 @@ func TestRedisCacheInvalidateHidesEveryVariant(t *testing.T) {
 	ctx := context.Background()
 
 	queries := []service.ListQuery{
-		{Page: 1, PageSize: 20},
-		{Status: domain.StatusDone, Page: 1, PageSize: 20},
-		{Assignee: "alice", Page: 2, PageSize: 5},
+		{PageSize: 20},
+		{Status: domain.StatusDone, PageSize: 20},
+		{Assignee: "alice", Cursor: "cursor-alice-2", PageSize: 5},
 	}
 	for _, query := range queries {
 		miss, err := cache.Get(ctx, query)
@@ -242,7 +238,7 @@ func TestRedisCacheInvalidateHidesEveryVariant(t *testing.T) {
 			t.Fatalf("Get() miss: %v", err)
 		}
 		if err := cache.Set(ctx, query, service.ListSnapshot{
-			Result: listPage([]domain.Task{{ID: "old", Title: "old", Status: domain.StatusDone}}, 1, 1, 20),
+			Result: listPage([]domain.Task{{ID: "old", Title: "old", Status: domain.StatusDone}}, 20, "", false),
 			Token:  miss.Token,
 		}); err != nil {
 			t.Fatalf("Set(): %v", err)
@@ -270,7 +266,7 @@ func TestRedisCacheInvalidateHidesEveryVariant(t *testing.T) {
 func TestRedisCacheStaleRefillRace(t *testing.T) {
 	cache := newIntegrationCache(t, time.Minute)
 	ctx := context.Background()
-	query := service.ListQuery{Page: 1, PageSize: 20}
+	query := service.ListQuery{PageSize: 20}
 
 	stale, err := cache.Get(ctx, query) // generation A, miss
 	if err != nil {
@@ -285,7 +281,7 @@ func TestRedisCacheStaleRefillRace(t *testing.T) {
 	}
 
 	if err := cache.Set(ctx, query, service.ListSnapshot{ // slow reader writes A
-		Result: listPage([]domain.Task{{ID: "stale", Title: "stale", Status: domain.StatusTodo}}, 1, 1, 20),
+		Result: listPage([]domain.Task{{ID: "stale", Title: "stale", Status: domain.StatusTodo}}, 20, "", false),
 		Token:  stale.Token,
 	}); err != nil {
 		t.Fatalf("Set() stale snapshot: %v", err)
@@ -303,7 +299,7 @@ func TestRedisCacheStaleRefillRace(t *testing.T) {
 func TestRedisCacheMalformedValueIsMissAndAllowsRefill(t *testing.T) {
 	cache := newIntegrationCache(t, time.Minute)
 	ctx := context.Background()
-	query := service.ListQuery{Page: 1, PageSize: 20}
+	query := service.ListQuery{PageSize: 20}
 
 	miss, err := cache.Get(ctx, query)
 	if err != nil {
@@ -328,7 +324,7 @@ func TestRedisCacheMalformedValueIsMissAndAllowsRefill(t *testing.T) {
 		t.Fatalf("poison key still present after recovery: %v", err)
 	}
 
-	page := listPage([]domain.Task{{ID: "id-1", Title: "refilled", Status: domain.StatusTodo}}, 1, 1, 20)
+	page := listPage([]domain.Task{{ID: "id-1", Title: "refilled", Status: domain.StatusTodo}}, 20, "", false)
 	if err := cache.Set(ctx, query, service.ListSnapshot{Result: page, Token: got.Token}); err != nil {
 		t.Fatalf("Set() after poison recovery: %v", err)
 	}
@@ -341,7 +337,7 @@ func TestRedisCacheMalformedValueIsMissAndAllowsRefill(t *testing.T) {
 func TestRedisCacheWrongVersionIsMissAndAllowsRefill(t *testing.T) {
 	cache := newIntegrationCache(t, time.Minute)
 	ctx := context.Background()
-	query := service.ListQuery{Page: 1, PageSize: 20}
+	query := service.ListQuery{PageSize: 20}
 
 	miss, err := cache.Get(ctx, query)
 	if err != nil {
@@ -367,7 +363,7 @@ func TestRedisCacheWrongVersionIsMissAndAllowsRefill(t *testing.T) {
 func TestRedisCacheInvalidPayloadDoesNotDeleteConcurrentReplacement(t *testing.T) {
 	cache := newIntegrationCache(t, time.Minute)
 	ctx := context.Background()
-	query := service.ListQuery{Page: 1, PageSize: 20}
+	query := service.ListQuery{PageSize: 20}
 
 	miss, err := cache.Get(ctx, query)
 	if err != nil {
@@ -382,7 +378,7 @@ func TestRedisCacheInvalidPayloadDoesNotDeleteConcurrentReplacement(t *testing.T
 	// Simulate the race the Lua script must win: another writer replaced the
 	// poison with a valid payload before compare-and-delete ran. Direct CAD
 	// against the observed poison must leave the replacement alone.
-	validPage := listPage([]domain.Task{{ID: "id-1", Title: "fresh", Status: domain.StatusTodo}}, 1, 1, 20)
+	validPage := listPage([]domain.Task{{ID: "id-1", Title: "fresh", Status: domain.StatusTodo}}, 20, "", false)
 	if err := cache.Set(ctx, query, service.ListSnapshot{Result: validPage, Token: miss.Token}); err != nil {
 		t.Fatalf("concurrent Set: %v", err)
 	}
@@ -412,7 +408,7 @@ func TestRedisCacheConcurrentFirstReadsShareGeneration(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			snapshot, err := cache.Get(ctx, service.ListQuery{Page: 1, PageSize: 20})
+			snapshot, err := cache.Get(ctx, service.ListQuery{PageSize: 20})
 			if err != nil {
 				errs <- err
 				return
