@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -228,10 +227,12 @@ func TestListEmptyReturnsNonNilSlice(t *testing.T) {
 	}
 }
 
-func TestListReturnsTasksOrderedByID(t *testing.T) {
+func TestListReturnsTasksOrderedFIFO(t *testing.T) {
 	repo, _ := newTestRepository(t)
 
 	first := mustCreate(t, repo, "first")
+	// Ensure a distinct created_at so FIFO is not only an id tie-break.
+	time.Sleep(2 * time.Millisecond)
 	second := mustCreate(t, repo, "second")
 
 	page, err := repo.ListPage(context.Background(), allTasks)
@@ -242,14 +243,14 @@ func TestListReturnsTasksOrderedByID(t *testing.T) {
 		t.Fatalf("page = %+v, want two tasks", page)
 	}
 
-	ids := []string{page.Tasks[0].ID, page.Tasks[1].ID}
-	if !sort.StringsAreSorted(ids) {
-		t.Fatalf("IDs = %v, want ascending identifier order", ids)
+	if page.Tasks[0].ID != first.ID || page.Tasks[1].ID != second.ID {
+		t.Fatalf("order = [%s, %s], want oldest-first FIFO [%s, %s]",
+			page.Tasks[0].ID, page.Tasks[1].ID, first.ID, second.ID)
 	}
-
-	byID := map[string]domain.Task{page.Tasks[0].ID: page.Tasks[0], page.Tasks[1].ID: page.Tasks[1]}
-	if byID[first.ID] != first || byID[second.ID] != second {
-		t.Fatalf("ListPage() = %+v, want the stored tasks", page.Tasks)
+	if !page.Tasks[0].CreatedAt.Before(page.Tasks[1].CreatedAt) &&
+		!page.Tasks[0].CreatedAt.Equal(page.Tasks[1].CreatedAt) {
+		t.Fatalf("created_at order = %v then %v, want non-decreasing",
+			page.Tasks[0].CreatedAt, page.Tasks[1].CreatedAt)
 	}
 }
 
@@ -631,20 +632,23 @@ func TestListCombinesFilters(t *testing.T) {
 	}
 }
 
-// TestListPaginatesDeterministically proves keyset pages are ordered by id and
-// do not overlap for a fixed data set.
+// TestListPaginatesDeterministically proves FIFO keyset pages do not overlap
+// for a fixed data set and walk oldest → newest.
 func TestListPaginatesDeterministically(t *testing.T) {
 	repo, _ := newTestRepository(t)
+	created := make([]domain.Task, 0, 5)
 	for _, title := range []string{"one", "two", "three", "four", "five"} {
-		mustCreate(t, repo, title)
+		created = append(created, mustCreate(t, repo, title))
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	seen := make(map[string]struct{}, 5)
-	var allIDs []string
+	var walked []domain.Task
+	var afterCreatedAt time.Time
 	afterID := ""
 	for pageNumber, wantSize := range []int{2, 2, 1} {
 		page, err := repo.ListPage(context.Background(), service.Filter{
-			Limit: 2, AfterID: afterID,
+			Limit: 2, AfterCreatedAt: afterCreatedAt, AfterID: afterID,
 		})
 		if err != nil {
 			t.Fatalf("ListPage(page %d) unexpected error: %v", pageNumber+1, err)
@@ -657,21 +661,27 @@ func TestListPaginatesDeterministically(t *testing.T) {
 				t.Fatalf("task %s appeared on two pages", task.ID)
 			}
 			seen[task.ID] = struct{}{}
-			allIDs = append(allIDs, task.ID)
+			walked = append(walked, task)
 		}
 		if len(page.Tasks) > 0 {
-			afterID = page.Tasks[len(page.Tasks)-1].ID
+			last := page.Tasks[len(page.Tasks)-1]
+			afterCreatedAt = last.CreatedAt
+			afterID = last.ID
 		}
 	}
 
 	if len(seen) != 5 {
 		t.Fatalf("pages covered %d tasks, want 5", len(seen))
 	}
-	if !sort.StringsAreSorted(allIDs) {
-		t.Fatalf("IDs = %v, want ascending identifier order across pages", allIDs)
+	for i, task := range walked {
+		if task.ID != created[i].ID {
+			t.Fatalf("walk[%d] = %s, want %s (FIFO)", i, task.ID, created[i].ID)
+		}
 	}
 
-	empty, err := repo.ListPage(context.Background(), service.Filter{Limit: 2, AfterID: afterID})
+	empty, err := repo.ListPage(context.Background(), service.Filter{
+		Limit: 2, AfterCreatedAt: afterCreatedAt, AfterID: afterID,
+	})
 	if err != nil {
 		t.Fatalf("ListPage(after last) unexpected error: %v", err)
 	}
@@ -682,10 +692,11 @@ func TestListPaginatesDeterministically(t *testing.T) {
 
 // TestListCursorAvoidsOffsetShift shows why keyset pagination replaces offsets:
 // deleting a prior-page row between requests would make OFFSET skip a live row,
-// while continuing after the last seen id still returns that row.
+// while continuing after the last seen keyset position still returns that row.
 func TestListCursorAvoidsOffsetShift(t *testing.T) {
 	repo, db := newTestRepository(t)
 
+	// ids[0] is oldest … ids[4] is newest. FIFO first page is ids[0], ids[1].
 	ids := []string{
 		"10000000-0000-4000-8000-000000000001",
 		"10000000-0000-4000-8000-000000000002",
@@ -693,10 +704,12 @@ func TestListCursorAvoidsOffsetShift(t *testing.T) {
 		"10000000-0000-4000-8000-000000000004",
 		"10000000-0000-4000-8000-000000000005",
 	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i, id := range ids {
 		if _, err := db.ExecContext(context.Background(),
-			`INSERT INTO tasks (id, title, description, status, assignee) VALUES ($1::uuid, $2, '', 'todo', NULL)`,
-			id, fmt.Sprintf("task-%d", i+1),
+			`INSERT INTO tasks (id, title, description, status, assignee, created_at)
+			 VALUES ($1::uuid, $2, '', 'todo', NULL, $3::timestamptz)`,
+			id, fmt.Sprintf("task-%d", i+1), base.Add(time.Duration(i)*time.Second),
 		); err != nil {
 			t.Fatalf("insert %s: %v", id, err)
 		}
@@ -707,14 +720,16 @@ func TestListCursorAvoidsOffsetShift(t *testing.T) {
 		t.Fatalf("ListPage(first): %v", err)
 	}
 	if len(first.Tasks) != 2 || first.Tasks[0].ID != ids[0] || first.Tasks[1].ID != ids[1] {
-		t.Fatalf("first = %+v, want the first two ids", first.Tasks)
+		t.Fatalf("first = %+v, want oldest two ids", first.Tasks)
 	}
 
 	if _, err := db.ExecContext(context.Background(), `DELETE FROM tasks WHERE id = $1::uuid`, ids[0]); err != nil {
-		t.Fatalf("delete first row: %v", err)
+		t.Fatalf("delete oldest row: %v", err)
 	}
 
-	cursorPage, err := repo.ListPage(context.Background(), service.Filter{Limit: 2, AfterID: ids[1]})
+	cursorPage, err := repo.ListPage(context.Background(), service.Filter{
+		Limit: 2, AfterCreatedAt: first.Tasks[1].CreatedAt, AfterID: ids[1],
+	})
 	if err != nil {
 		t.Fatalf("ListPage(cursor): %v", err)
 	}
@@ -724,7 +739,7 @@ func TestListCursorAvoidsOffsetShift(t *testing.T) {
 
 	var offsetIDs []string
 	rows, err := db.QueryContext(context.Background(),
-		`SELECT id::text FROM tasks ORDER BY id LIMIT 2 OFFSET 2`)
+		`SELECT id::text FROM tasks ORDER BY created_at ASC, id ASC LIMIT 2 OFFSET 2`)
 	if err != nil {
 		t.Fatalf("offset query: %v", err)
 	}
@@ -739,6 +754,7 @@ func TestListCursorAvoidsOffsetShift(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("offset rows: %v", err)
 	}
+	// After deleting the oldest row, OFFSET 2 skips past ids[2] to ids[3].
 	if len(offsetIDs) != 2 || offsetIDs[0] != ids[3] {
 		t.Fatalf("offset page = %v, want the classic skip starting at ids[3]", offsetIDs)
 	}
@@ -749,16 +765,23 @@ func TestListCursorAvoidsOffsetShift(t *testing.T) {
 
 func TestListInsertBetweenPagesIsVisibleOnLaterPage(t *testing.T) {
 	repo, db := newTestRepository(t)
-	ids := []string{
-		"20000000-0000-4000-8000-000000000001",
-		"20000000-0000-4000-8000-000000000003",
-	}
-	for _, id := range ids {
+	// oldest and newest around a gap; FIFO first page is the oldest.
+	oldest := "20000000-0000-4000-8000-000000000001"
+	newest := "20000000-0000-4000-8000-000000000003"
+	base := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	for _, row := range []struct {
+		id string
+		at time.Time
+	}{
+		{oldest, base},
+		{newest, base.Add(2 * time.Second)},
+	} {
 		if _, err := db.ExecContext(context.Background(),
-			`INSERT INTO tasks (id, title, description, status, assignee) VALUES ($1::uuid, $2, '', 'todo', NULL)`,
-			id, id,
+			`INSERT INTO tasks (id, title, description, status, assignee, created_at)
+			 VALUES ($1::uuid, $2, '', 'todo', NULL, $3::timestamptz)`,
+			row.id, row.id, row.at,
 		); err != nil {
-			t.Fatalf("insert %s: %v", id, err)
+			t.Fatalf("insert %s: %v", row.id, err)
 		}
 	}
 
@@ -766,19 +789,23 @@ func TestListInsertBetweenPagesIsVisibleOnLaterPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPage(first): %v", err)
 	}
-	if len(first.Tasks) != 1 || first.Tasks[0].ID != ids[0] {
-		t.Fatalf("first = %+v, want %s", first.Tasks, ids[0])
+	if len(first.Tasks) != 1 || first.Tasks[0].ID != oldest {
+		t.Fatalf("first = %+v, want %s", first.Tasks, oldest)
 	}
 
+	// Insert a newer-than-cursor row in the gap; it must appear when continuing.
 	inserted := "20000000-0000-4000-8000-000000000002"
 	if _, err := db.ExecContext(context.Background(),
-		`INSERT INTO tasks (id, title, description, status, assignee) VALUES ($1::uuid, 'inserted', '', 'todo', NULL)`,
-		inserted,
+		`INSERT INTO tasks (id, title, description, status, assignee, created_at)
+		 VALUES ($1::uuid, 'inserted', '', 'todo', NULL, $2::timestamptz)`,
+		inserted, base.Add(time.Second),
 	); err != nil {
 		t.Fatalf("insert between: %v", err)
 	}
 
-	second, err := repo.ListPage(context.Background(), service.Filter{Limit: 10, AfterID: first.Tasks[0].ID})
+	second, err := repo.ListPage(context.Background(), service.Filter{
+		Limit: 10, AfterCreatedAt: first.Tasks[0].CreatedAt, AfterID: first.Tasks[0].ID,
+	})
 	if err != nil {
 		t.Fatalf("ListPage(second): %v", err)
 	}
@@ -786,8 +813,8 @@ func TestListInsertBetweenPagesIsVisibleOnLaterPage(t *testing.T) {
 	for _, task := range second.Tasks {
 		got = append(got, task.ID)
 	}
-	if len(got) != 2 || got[0] != inserted || got[1] != ids[1] {
-		t.Fatalf("second = %v, want inserted id then the original second row", got)
+	if len(got) != 2 || got[0] != inserted || got[1] != newest {
+		t.Fatalf("second = %v, want inserted then newest", got)
 	}
 }
 
@@ -805,11 +832,11 @@ func TestListUpdateLeavingFilterIsNotReturned(t *testing.T) {
 	if len(page.Tasks) != 1 {
 		t.Fatalf("first page = %+v, want one task", page.Tasks)
 	}
-	afterID := page.Tasks[0].ID
+	cursor := page.Tasks[0]
 
 	// Move the other matching row out of the filter between pages.
 	other := leave
-	if afterID == leave.ID {
+	if cursor.ID == leave.ID {
 		other = keep
 	}
 	other.Status = domain.StatusTodo
@@ -818,7 +845,8 @@ func TestListUpdateLeavingFilterIsNotReturned(t *testing.T) {
 	}
 
 	rest, err := repo.ListPage(context.Background(), service.Filter{
-		Status: domain.StatusDone, Assignee: "alice", Limit: 10, AfterID: afterID,
+		Status: domain.StatusDone, Assignee: "alice", Limit: 10,
+		AfterCreatedAt: cursor.CreatedAt, AfterID: cursor.ID,
 	})
 	if err != nil {
 		t.Fatalf("ListPage(rest): %v", err)

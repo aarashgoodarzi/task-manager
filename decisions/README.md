@@ -27,6 +27,8 @@ file and the older record is marked `Superseded by NNNN`.
 | [0015](0015-load-testing-and-profiling.md) | Load testing `GET /tasks` with a small Go runner and opt-in profiling | Accepted | `cmd/loadtest/`, `internal/infra/config/`, `internal/app/`, README |
 | [0016](0016-cursor-pagination-for-task-list.md) | Cursor (keyset) pagination for GET /tasks | Accepted | `internal/task/**`, `api/openapi.yaml`, `cmd/loadtest/`, README |
 | [0017](0017-encapsulate-handler-repository-wiring.md) | Encapsulate repository construction inside handler composition | Accepted | `internal/app/` |
+| [0018](0018-lifo-task-list-ordering.md) | LIFO ordering for GET /tasks via created_at keyset | Superseded by 0019 | `internal/task/**`, migrations, `api/openapi.yaml`, README |
+| [0019](0019-fifo-task-list-ordering.md) | FIFO ordering for GET /tasks via created_at keyset | Accepted | `internal/task/**`, `api/openapi.yaml`, README |
 
 ## When to write one
 

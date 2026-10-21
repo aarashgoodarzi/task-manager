@@ -18,6 +18,7 @@ var requiredColumns = []struct {
 	column string
 }{
 	{table: "tasks", column: "assignee"},
+	{table: "tasks", column: "created_at"},
 }
 
 // SchemaQuerier is the subset of *sql.DB and *sql.Conn that VerifySchema needs,

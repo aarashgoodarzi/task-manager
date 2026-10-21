@@ -32,10 +32,11 @@ const (
 // beside its only consumer, rather than in a shared ports package.
 type Repository interface {
 	Create(ctx context.Context, task domain.Task) (domain.Task, error)
-	// ListPage returns one page of matching tasks ordered by id ascending.
-	// When AfterID is set, only rows with id greater than AfterID are returned.
-	// Limit is the maximum number of rows to fetch; the use case may request
-	// one extra row to detect whether another page exists.
+	// ListPage returns one page of matching tasks ordered FIFO (oldest first:
+	// created_at ASC, id ASC). When AfterCreatedAt/AfterID are set, only rows
+	// strictly newer than that keyset position are returned. Limit is the
+	// maximum number of rows to fetch; the use case may request one extra row
+	// to detect whether another page exists.
 	ListPage(ctx context.Context, filter Filter) (TaskPage, error)
 	Get(ctx context.Context, id string) (domain.Task, error)
 	Update(ctx context.Context, task domain.Task) (domain.Task, error)
@@ -66,9 +67,11 @@ type ListQuery struct {
 	// PageSize is the maximum number of tasks in the page. Zero means
 	// DefaultPageSize.
 	PageSize int
-	// AfterID is the exclusive lower bound derived from Cursor. It is empty
-	// for the first page and is set by Normalize; callers should not set it.
-	AfterID string
+	// AfterCreatedAt and AfterID are the exclusive FIFO keyset bound derived
+	// from Cursor. Both are empty/zero for the first page and are set by
+	// Normalize; callers should not set them.
+	AfterCreatedAt time.Time
+	AfterID        string
 }
 
 // Normalize applies the documented defaults and rejects values outside the
@@ -113,23 +116,26 @@ func (q ListQuery) Normalize() (ListQuery, error) {
 	}
 
 	if q.Cursor != "" {
-		afterID, err := DecodeCursor(q.Cursor, normalized)
+		afterCreatedAt, afterID, err := DecodeCursor(q.Cursor, normalized)
 		if err != nil {
 			return ListQuery{}, err
 		}
+		normalized.AfterCreatedAt = afterCreatedAt
 		normalized.AfterID = afterID
 	}
 
 	return normalized, nil
 }
 
-// Filter is the keyset query the repository executes. AfterID is empty for the
-// first page and otherwise the exclusive lower bound on id.
+// Filter is the keyset query the repository executes. AfterCreatedAt and
+// AfterID are zero/empty for the first page and otherwise the exclusive FIFO
+// lower bound (continue with rows newer than that position).
 type Filter struct {
-	Status   domain.Status
-	Assignee string
-	Limit    int
-	AfterID  string
+	Status         domain.Status
+	Assignee       string
+	Limit          int
+	AfterCreatedAt time.Time
+	AfterID        string
 }
 
 // TaskPage is one page of repository results. Totals are not computed: cursor
@@ -208,11 +214,11 @@ func (s *Service) Create(ctx context.Context, in Input) (domain.Task, error) {
 // List returns one page of tasks matching query. A cached page is returned
 // without touching PostgreSQL; any cache failure falls back to the database.
 //
-// Pagination is keyset-based on id: the repository fetches one extra row so
-// HasMore and NextCursor can be computed without a COUNT(*). Concurrent
-// inserts, deletes, and updates between requests can still change which rows
-// appear on later pages; the cursor only prevents the classic offset-shift
-// skip/duplicate pattern, not a multi-request snapshot.
+// Pagination is keyset-based on (created_at, id) in FIFO order: the repository
+// fetches one extra row so HasMore and NextCursor can be computed without a
+// COUNT(*). Concurrent inserts, deletes, and updates between requests can
+// still change which rows appear on later pages; the cursor only prevents the
+// classic offset-shift skip/duplicate pattern, not a multi-request snapshot.
 func (s *Service) List(ctx context.Context, query ListQuery) (ListResult, error) {
 	query, err := query.Normalize()
 	if err != nil {
@@ -238,10 +244,11 @@ func (s *Service) List(ctx context.Context, query ListQuery) (ListResult, error)
 	// Fetch one extra row to learn whether another page exists without a
 	// separate count query.
 	page, err := s.repo.ListPage(ctx, Filter{
-		Status:   query.Status,
-		Assignee: query.Assignee,
-		Limit:    query.PageSize + 1,
-		AfterID:  query.AfterID,
+		Status:         query.Status,
+		Assignee:       query.Assignee,
+		Limit:          query.PageSize + 1,
+		AfterCreatedAt: query.AfterCreatedAt,
+		AfterID:        query.AfterID,
 	})
 	if err != nil {
 		return ListResult{}, fmt.Errorf("service: list tasks: %w", err)
@@ -261,7 +268,8 @@ func (s *Service) List(ctx context.Context, query ListQuery) (ListResult, error)
 
 	nextCursor := ""
 	if hasMore {
-		encoded, err := EncodeCursor(tasks[len(tasks)-1].ID, query)
+		last := tasks[len(tasks)-1]
+		encoded, err := EncodeCursor(last.CreatedAt, last.ID, query)
 		if err != nil {
 			return ListResult{}, fmt.Errorf("service: list tasks: %w", err)
 		}

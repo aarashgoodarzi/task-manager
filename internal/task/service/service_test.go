@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aarashgoodarzi/task-manager/internal/task/domain"
 )
@@ -47,6 +48,7 @@ func (f *fakeRepo) Create(_ context.Context, task domain.Task) (domain.Task, err
 	}
 	f.seq++
 	task.ID = fmt.Sprintf("id-%d", f.seq)
+	task.CreatedAt = time.Unix(int64(f.seq), 0).UTC()
 	f.tasks[task.ID] = task
 	return task, nil
 }
@@ -66,17 +68,29 @@ func (f *fakeRepo) ListPage(_ context.Context, filter Filter) (TaskPage, error) 
 		if filter.Assignee != "" && task.Assignee != filter.Assignee {
 			continue
 		}
-		if filter.AfterID != "" && task.ID <= filter.AfterID {
+		if filter.AfterID != "" && !afterKeyset(task, filter.AfterCreatedAt, filter.AfterID) {
 			continue
 		}
 		matched = append(matched, task)
 	}
-	sort.Slice(matched, func(i, j int) bool { return matched[i].ID < matched[j].ID })
+	sort.Slice(matched, func(i, j int) bool {
+		if !matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
+			return matched[i].CreatedAt.Before(matched[j].CreatedAt)
+		}
+		return matched[i].ID < matched[j].ID
+	})
 
 	if filter.Limit >= 0 && len(matched) > filter.Limit {
 		matched = matched[:filter.Limit]
 	}
 	return TaskPage{Tasks: matched}, nil
+}
+
+func afterKeyset(task domain.Task, afterCreatedAt time.Time, afterID string) bool {
+	if task.CreatedAt.After(afterCreatedAt) {
+		return true
+	}
+	return task.CreatedAt.Equal(afterCreatedAt) && task.ID > afterID
 }
 
 func (f *fakeRepo) Get(_ context.Context, id string) (domain.Task, error) {
@@ -700,12 +714,15 @@ func TestListAppliesFiltersBeforePagination(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["00000000-0000-4000-8000-000000000001"] = domain.Task{
 		ID: "00000000-0000-4000-8000-000000000001", Title: "todo", Status: domain.StatusTodo, Assignee: "alice",
+		CreatedAt: time.Unix(1, 0).UTC(),
 	}
 	repo.tasks["00000000-0000-4000-8000-000000000002"] = domain.Task{
 		ID: "00000000-0000-4000-8000-000000000002", Title: "done", Status: domain.StatusDone, Assignee: "alice",
+		CreatedAt: time.Unix(2, 0).UTC(),
 	}
 	repo.tasks["00000000-0000-4000-8000-000000000003"] = domain.Task{
 		ID: "00000000-0000-4000-8000-000000000003", Title: "other owner", Status: domain.StatusDone, Assignee: "bob",
+		CreatedAt: time.Unix(3, 0).UTC(),
 	}
 
 	result, err := newService(repo).List(context.Background(), ListQuery{
@@ -726,13 +743,17 @@ func TestListAppliesFiltersBeforePagination(t *testing.T) {
 
 func TestListSecondPageUsesCursor(t *testing.T) {
 	repo := newFakeRepo()
+	// Oldest → newest by created_at; FIFO first page is oldest first.
 	ids := []string{
 		"00000000-0000-4000-8000-000000000001",
 		"00000000-0000-4000-8000-000000000002",
 		"00000000-0000-4000-8000-000000000003",
 	}
-	for _, id := range ids {
-		repo.tasks[id] = domain.Task{ID: id, Title: id, Status: domain.StatusTodo}
+	for i, id := range ids {
+		repo.tasks[id] = domain.Task{
+			ID: id, Title: id, Status: domain.StatusTodo,
+			CreatedAt: time.Unix(int64(i+1), 0).UTC(),
+		}
 	}
 
 	first, err := newService(repo).List(context.Background(), ListQuery{PageSize: 2})
@@ -742,6 +763,9 @@ func TestListSecondPageUsesCursor(t *testing.T) {
 	if !first.HasMore || first.NextCursor == "" || len(first.Tasks) != 2 {
 		t.Fatalf("first = %+v, want two tasks and a continuation cursor", first)
 	}
+	if first.Tasks[0].ID != ids[0] || first.Tasks[1].ID != ids[1] {
+		t.Fatalf("first = %+v, want oldest-then-middle (FIFO)", first.Tasks)
+	}
 
 	second, err := newService(repo).List(context.Background(), ListQuery{Cursor: first.NextCursor, PageSize: 2})
 	if err != nil {
@@ -750,8 +774,11 @@ func TestListSecondPageUsesCursor(t *testing.T) {
 	if repo.lastFilter.AfterID != ids[1] || repo.lastFilter.Limit != 3 {
 		t.Fatalf("filter = %+v, want after %s and limit 3", repo.lastFilter, ids[1])
 	}
+	if !repo.lastFilter.AfterCreatedAt.Equal(time.Unix(2, 0).UTC()) {
+		t.Fatalf("AfterCreatedAt = %v, want unix 2", repo.lastFilter.AfterCreatedAt)
+	}
 	if second.HasMore || len(second.Tasks) != 1 || second.Tasks[0].ID != ids[2] {
-		t.Fatalf("second = %+v, want the last task and end of list", second)
+		t.Fatalf("second = %+v, want the newest task and end of list", second)
 	}
 }
 
@@ -759,6 +786,7 @@ func TestListFinalPageHasNoCursor(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["00000000-0000-4000-8000-000000000001"] = domain.Task{
 		ID: "00000000-0000-4000-8000-000000000001", Title: "only", Status: domain.StatusTodo,
+		CreatedAt: time.Unix(1, 0).UTC(),
 	}
 
 	result, err := newService(repo).List(context.Background(), ListQuery{PageSize: 2})
@@ -777,7 +805,10 @@ func TestListHasMoreAcrossPages(t *testing.T) {
 	repo := newFakeRepo()
 	for i := 0; i < 21; i++ {
 		id := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
-		repo.tasks[id] = domain.Task{ID: id, Title: id, Status: domain.StatusTodo}
+		repo.tasks[id] = domain.Task{
+			ID: id, Title: id, Status: domain.StatusTodo,
+			CreatedAt: time.Unix(int64(i+1), 0).UTC(),
+		}
 	}
 
 	result, err := newService(repo).List(context.Background(), ListQuery{PageSize: 20})
@@ -835,7 +866,11 @@ func TestListCacheHitReturnsFullMetadata(t *testing.T) {
 }
 
 func TestListRejectsInvalidQuery(t *testing.T) {
-	validCursor, err := EncodeCursor("6f1c2a4e-8d3b-4f5a-9c7e-1a2b3c4d5e6f", ListQuery{PageSize: DefaultPageSize})
+	validCursor, err := EncodeCursor(
+		time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC),
+		"6f1c2a4e-8d3b-4f5a-9c7e-1a2b3c4d5e6f",
+		ListQuery{PageSize: DefaultPageSize},
+	)
 	if err != nil {
 		t.Fatalf("EncodeCursor() unexpected error: %v", err)
 	}

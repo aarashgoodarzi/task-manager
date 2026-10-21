@@ -28,10 +28,10 @@ const (
 	defaultKeyPrefix = "task-manager"
 
 	// cacheSchemaVersion versions the cached payload. A payload with another
-	// version is treated as a miss, not decoded speculatively. Version 3
-	// replaced page/total/total_pages with cursor pagination metadata, so
-	// older entries are ignored rather than decoded with missing fields.
-	cacheSchemaVersion = 3
+	// version is treated as a miss, not decoded speculatively. Version 5
+	// follows FIFO list order (created_at ASC, id ASC); older versions
+	// (including LIFO v4) must not be served.
+	cacheSchemaVersion = 5
 
 	// generationReadAttempts bounds the initialize-on-first-read loop when
 	// several readers race to create the generation key.

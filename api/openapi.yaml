@@ -46,10 +46,10 @@ paths:
       operationId: listTasks
       summary: List, filter, and paginate tasks
       description: |
-        Returns one page of tasks ordered by `id` ascending, using opaque
-        cursor (keyset) pagination. The identifier is unique, so the ordering
-        is deterministic and pages never overlap for a fixed data set.
-        Ordering is by identifier, not by creation time.
+        Returns one page of tasks ordered FIFO (oldest first) by
+        `created_at` ascending, with `id` ascending as the tie-breaker.
+        Pagination is opaque cursor (keyset) on that pair, so pages never
+        overlap for a fixed data set.
 
         Filters are applied in SQL before the cursor bound and `page_size`
         limit. An empty result is returned as `"items": []`, never `null`.
@@ -646,8 +646,8 @@ components:
         items:
           type: array
           description: |
-            Tasks in this page, ordered by `id` ascending. `[]` when empty;
-            never `null`.
+            Tasks in this page, ordered FIFO (oldest first by `created_at`,
+            then `id`). `[]` when empty; never `null`.
           items:
             $ref: '#/components/schemas/Task'
         next_cursor:

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -83,6 +84,9 @@ type Task struct {
 	// Assignee is a free-form label naming who owns the task. It is stored
 	// trimmed and empty means unassigned.
 	Assignee string
+	// CreatedAt is set by persistence on insert and never changed. It drives
+	// FIFO list ordering; it is not part of the HTTP create/update body.
+	CreatedAt time.Time
 }
 
 // Validate checks the aggregate invariants. Titles are trimmed before the

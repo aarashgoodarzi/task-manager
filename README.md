@@ -443,7 +443,7 @@ Base URL for the examples: `http://localhost:8080`.
 | Method | Path | Purpose | Success | Request body |
 | --- | --- | --- | --- | --- |
 | `POST` | `/task` | Create a task | `201` with the task and a `Location: /tasks/{id}` header | Required |
-| `GET` | `/tasks` | List, filter, and cursor-paginate tasks ordered by `id` ascending | `200` with a cursor envelope, `items: []` when empty | None |
+| `GET` | `/tasks` | List, filter, and cursor-paginate tasks ordered FIFO (oldest first) | `200` with a cursor envelope, `items: []` when empty | None |
 | `GET` | `/tasks/{id}` | Retrieve one task | `200` with the task | None |
 | `PUT` | `/tasks/{id}` | Replace the mutable fields of a task | `200` with the replaced task | Required |
 | `DELETE` | `/tasks/{id}` | Delete a task | `204` with no body | None |
@@ -479,9 +479,8 @@ Additional behavior:
   never created by `PUT`.
 - A malformed `{id}` returns `400 validation_error`; a well-formed UUID that is
   not stored returns `404 not_found`.
-- `GET /tasks` returns one cursor page ordered by `id` ascending. The identifier is
-  unique, so for a fixed data set pages never overlap; it is
-  not creation order.
+- `GET /tasks` returns one cursor page ordered FIFO (oldest first by
+  `created_at`, then `id`). For a fixed data set, pages never overlap.
 - No authentication, authorization, or sorting controls are implemented.
 
 #### Create a task
@@ -539,7 +538,7 @@ page-number metadata):
 
 Metadata semantics:
 
-- `items` holds the page's tasks, ordered by `id` ascending. It is always an
+- `items` holds the page's tasks, ordered FIFO (oldest first). It is always an
   array, `[]` when empty.
 - `has_more` is true when another page exists after this one.
 - `next_cursor` is an opaque continuation token when `has_more` is true, and
@@ -922,20 +921,23 @@ CREATE TABLE IF NOT EXISTS tasks (
     description TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL CHECK (status IN ('todo', 'in_progress', 'done')),
     assignee    TEXT CHECK (assignee IS NULL
-                            OR (btrim(assignee) <> '' AND char_length(assignee) <= 100))
+                            OR (btrim(assignee) <> '' AND char_length(assignee) <= 100)),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks (status);
 CREATE INDEX IF NOT EXISTS tasks_assignee_idx ON tasks (assignee);
+CREATE INDEX IF NOT EXISTS tasks_created_at_id_idx ON tasks (created_at DESC, id DESC);
 ```
 
-The table contains exactly the API fields. The `CHECK` constraints duplicate
-the domain rules so a manual statement or a future write path cannot store a
-blank title, an unknown status, or a blank/over-long assignee. `assignee` is
-NULL when unassigned, which is the single stored representation; the API
-always renders it as `""`. `GET /tasks` uses `id` ascending for its stable
-order, not creation order, and filters on the two indexed columns before
-applying `LIMIT`/`OFFSET`.
+The API fields map onto this table; `created_at` is persistence-only for FIFO
+ordering. The `CHECK` constraints duplicate the domain rules so a manual
+statement or a future write path cannot store a blank title, an unknown
+status, or a blank/over-long assignee. `assignee` is NULL when unassigned,
+which is the single stored representation; the API always renders it as `""`.
+`created_at` is set on insert and never updated; `GET /tasks` orders FIFO on
+`(created_at ASC, id ASC)` and filters on the indexed columns before
+applying the keyset bound and `LIMIT`.
 
 ### Migrations
 
@@ -1594,7 +1596,9 @@ as the practical guide for setup, operation, and the current API.
 | [0012. Consumer-owned ports remain the dependency-inversion boundary](decisions/0012-consumer-owned-ports-dependency-audit.md) | Audit the import graph against the dependency rule: ports stay with consumers, adapters and the composition root point inward, and no production code needed to change. | Accepted |
 | [0013. Redis cache-aside for task listing with generation-token invalidation](decisions/0013-redis-cache-aside-for-task-list.md) | Cache `GET /tasks` in Redis with a generation token; invalidate after committed creates, updates, and deletes, and fail open to PostgreSQL when Redis is unavailable. | Accepted |
 | [0014. Task filtering and pagination on a paginated collection envelope](decisions/0014-task-filtering-and-pagination.md) | Add `status`/`assignee` filters and original page-number pagination (later replaced by cursor pagination). | Accepted (pagination superseded by 0016) |
-| [0016. Cursor (keyset) pagination for GET /tasks](decisions/0016-cursor-pagination-for-task-list.md) | Replace `page`/`total`/`total_pages` with opaque keyset cursors bound to filters; update Redis variant keys and drop per-page `COUNT(*)`. | Accepted |
+| [0016. Cursor (keyset) pagination for GET /tasks](decisions/0016-cursor-pagination-for-task-list.md) | Replace `page`/`total`/`total_pages` with opaque keyset cursors bound to filters; update Redis variant keys and drop per-page `COUNT(*)`. | Accepted (ordering amended by 0018/0019) |
+| [0018. LIFO ordering for GET /tasks via created_at keyset](decisions/0018-lifo-task-list-ordering.md) | Order the task list newest-first on `(created_at, id)` and bind both into the cursor. | Superseded by 0019 |
+| [0019. FIFO ordering for GET /tasks via created_at keyset](decisions/0019-fifo-task-list-ordering.md) | Order the task list oldest-first on `(created_at, id)` and bind both into the cursor. | Accepted |
 | [0015. Load testing `GET /tasks` with a small Go runner and opt-in profiling](decisions/0015-load-testing-and-profiling.md) | Measure the list endpoint with a reproducible, self-contained HTTP runner and a loopback-only pprof listener; report measured numbers instead of targets. | Accepted |
 
 No record is superseded or deprecated. ADRs 0003, 0004, and 0007 carry amendment

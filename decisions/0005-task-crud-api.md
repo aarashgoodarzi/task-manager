@@ -133,10 +133,10 @@ HTTP adapters, shared or feature-local, live in a `handler` package.
 when omitted, and `assignee` defaults to empty (unassigned), exactly as for
 creation. A missing ID is never upserted.
 
-List order is defined by the adapter: ascending `id`. The order is stable
-across calls but is not creation order; clients must not treat it as such.
-When the result is paginated, clients follow `next_cursor` until `has_more` is
-false (ADR 0016); there is no `total` / `total_pages` in the current contract.
+List order is FIFO (oldest first by `created_at`, then `id`); see
+[ADR 0019](0019-fifo-task-list-ordering.md). When the result is paginated,
+clients follow `next_cursor` until `has_more` is false (ADR 0016); there is
+no `total` / `total_pages` in the current contract.
 
 ### PostgreSQL adapter
 
@@ -148,7 +148,8 @@ the adapter as given and only relies on its contract:
 - `Create` generates the identifier and returns the stored copy.
 - A missing row becomes `service.ErrNotFound`; malformed identifiers surface as
   decoding errors, not as not-found.
-- `ListPage` returns one page ordered by `id` plus the filtered total (ADR 0014).
+- `ListPage` returns one FIFO page (ADR 0019); totals are not part of the
+  current cursor contract (ADR 0016).
 - Every method returns freshly scanned values, so callers cannot mutate adapter
   state.
 
@@ -247,7 +248,7 @@ Runtime behavior:
 - Adding a status value or a task field requires changing
   `internal/task/domain`, the HTTP mapping, the schema via a new migration, and
   this record. Statuses are a closed set by design.
-- `GET /tasks` order is ascending `id`; changing it is an API change and must be
+- `GET /tasks` order is FIFO by `created_at` (ADR 0019); changing it is an API change and must be
   reflected here and in the adapter.
 - The test suite is the specification of the API contract: status codes, JSON
   shapes, error codes, validation fields, and the full

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -56,12 +57,13 @@ func (r *stubRepository) Create(_ context.Context, task domain.Task) (domain.Tas
 
 	r.seq++
 	task.ID = fmt.Sprintf("%08x-0000-4000-8000-000000000000", r.seq)
+	task.CreatedAt = time.Unix(int64(r.seq), 0).UTC()
 	r.tasks[task.ID] = task
 	return task, nil
 }
 
-// ListPage mirrors the SQL adapter's contract: filter, order by ID, apply the
-// exclusive after-id bound, then limit.
+// ListPage mirrors the SQL adapter's contract: filter, FIFO order, apply the
+// exclusive keyset bound, then limit.
 func (r *stubRepository) ListPage(_ context.Context, filter service.Filter) (service.TaskPage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -74,17 +76,30 @@ func (r *stubRepository) ListPage(_ context.Context, filter service.Filter) (ser
 		if filter.Assignee != "" && task.Assignee != filter.Assignee {
 			continue
 		}
-		if filter.AfterID != "" && task.ID <= filter.AfterID {
+		if filter.AfterID != "" && !afterKeyset(task, filter.AfterCreatedAt, filter.AfterID) {
 			continue
 		}
 		matched = append(matched, task)
 	}
-	sort.Slice(matched, func(i, j int) bool { return matched[i].ID < matched[j].ID })
+	sort.Slice(matched, func(i, j int) bool {
+		if !matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
+			return matched[i].CreatedAt.Before(matched[j].CreatedAt)
+		}
+		return matched[i].ID < matched[j].ID
+	})
 
 	if filter.Limit >= 0 && len(matched) > filter.Limit {
 		matched = matched[:filter.Limit]
 	}
 	return service.TaskPage{Tasks: matched}, nil
+}
+
+// afterKeyset reports whether task is strictly newer than the FIFO cursor.
+func afterKeyset(task domain.Task, afterCreatedAt time.Time, afterID string) bool {
+	if task.CreatedAt.After(afterCreatedAt) {
+		return true
+	}
+	return task.CreatedAt.Equal(afterCreatedAt) && task.ID > afterID
 }
 
 func (r *stubRepository) Get(_ context.Context, id string) (domain.Task, error) {
@@ -349,13 +364,10 @@ func TestListTasksPopulated(t *testing.T) {
 	if len(tasks) != 2 {
 		t.Fatalf("len(tasks) = %d, want 2", len(tasks))
 	}
-
-	titles := map[string]bool{}
-	for _, task := range tasks {
-		titles[task.Title] = true
-	}
-	if !titles["first"] || !titles["second"] {
-		t.Fatalf("titles = %v, want both created tasks", titles)
+	// Stub IDs and created_at both increase with create order, so FIFO is
+	// oldest title first.
+	if tasks[0].Title != "first" || tasks[1].Title != "second" {
+		t.Fatalf("titles = [%s, %s], want FIFO [first, second]", tasks[0].Title, tasks[1].Title)
 	}
 }
 

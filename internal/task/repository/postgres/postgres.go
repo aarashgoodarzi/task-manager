@@ -22,7 +22,7 @@ var _ service.Repository = (*Repository)(nil)
 
 // selectColumns keeps every read and RETURNING clause in one place, so scanning
 // stays consistent with the stored column order.
-const selectColumns = "id, title, description, status, assignee"
+const selectColumns = "id, title, description, status, assignee, created_at"
 
 // Repository persists tasks in the tasks table.
 type Repository struct {
@@ -69,11 +69,11 @@ func (r *Repository) Create(ctx context.Context, task domain.Task) (domain.Task,
 	return domain.Task{}, fmt.Errorf("postgres: could not generate a unique task id in %d attempts", maxIDAttempts)
 }
 
-// ListPage returns one page of tasks matching filter, ordered by identifier
-// ascending. When AfterID is set, only rows with id greater than that bound
-// are returned (keyset pagination). Filtering, ordering, and the limit all
-// happen in PostgreSQL: the adapter never loads the collection to slice it in
-// memory.
+// ListPage returns one page of tasks matching filter, ordered FIFO (oldest
+// first: created_at ASC, id ASC). When AfterCreatedAt/AfterID are set, only
+// rows strictly newer than that keyset position are returned. Filtering,
+// ordering, and the limit all happen in PostgreSQL: the adapter never loads
+// the collection to slice it in memory.
 func (r *Repository) ListPage(ctx context.Context, filter service.Filter) (service.TaskPage, error) {
 	if r.db == nil {
 		return service.TaskPage{}, fmt.Errorf("postgres: list tasks: nil pool")
@@ -89,7 +89,7 @@ func (r *Repository) ListPage(ctx context.Context, filter service.Filter) (servi
 
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT `+selectColumns+` FROM tasks`+where+
-			fmt.Sprintf(` ORDER BY id LIMIT $%d`, len(args)+1),
+			fmt.Sprintf(` ORDER BY created_at ASC, id ASC LIMIT $%d`, len(args)+1),
 		pageArgs...)
 	if err != nil {
 		return service.TaskPage{}, fmt.Errorf("postgres: list tasks: %w", err)
@@ -112,11 +112,11 @@ func (r *Repository) ListPage(ctx context.Context, filter service.Filter) (servi
 }
 
 // filterClause builds the WHERE clause for status, assignee, and optional
-// keyset bound. Values are always bound as parameters; the placeholder numbers
-// follow the argument order.
+// FIFO keyset bound. Values are always bound as parameters; the placeholder
+// numbers follow the argument order.
 func filterClause(filter service.Filter) (string, []any) {
 	conditions := make([]string, 0, 3)
-	args := make([]any, 0, 3)
+	args := make([]any, 0, 4)
 
 	if filter.Status != "" {
 		args = append(args, string(filter.Status))
@@ -127,8 +127,13 @@ func filterClause(filter service.Filter) (string, []any) {
 		conditions = append(conditions, fmt.Sprintf("assignee = $%d", len(args)))
 	}
 	if filter.AfterID != "" {
-		args = append(args, filter.AfterID)
-		conditions = append(conditions, fmt.Sprintf("id > $%d::uuid", len(args)))
+		// Exclusive lower bound for ASC walk: rows newer than the cursor.
+		args = append(args, filter.AfterCreatedAt, filter.AfterID)
+		createdAtParam := len(args) - 1
+		idParam := len(args)
+		conditions = append(conditions, fmt.Sprintf(
+			"(created_at, id) > ($%d::timestamptz, $%d::uuid)", createdAtParam, idParam,
+		))
 	}
 	if len(conditions) == 0 {
 		return "", args
@@ -225,7 +230,9 @@ func scanTask(row scanner) (domain.Task, error) {
 		status   string
 		assignee sql.NullString
 	)
-	if err := row.Scan(&task.ID, &task.Title, &task.Description, &status, &assignee); err != nil {
+	if err := row.Scan(
+		&task.ID, &task.Title, &task.Description, &status, &assignee, &task.CreatedAt,
+	); err != nil {
 		return domain.Task{}, err
 	}
 	task.Status = domain.Status(status)

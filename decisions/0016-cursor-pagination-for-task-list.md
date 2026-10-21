@@ -1,12 +1,14 @@
 # 0016. Cursor (keyset) pagination for GET /tasks
 
-* Status: Accepted
+* Status: Accepted (ordering amended by [0018](0018-lifo-task-list-ordering.md),
+  then [0019](0019-fifo-task-list-ordering.md))
 * Date: 2026-10-21
 * Scope: `internal/task/**`, `api/openapi.yaml`, `cmd/loadtest/`, README
 * Related: [0014](0014-task-filtering-and-pagination.md) — filtering and the
   original page-number envelope (pagination superseded here);
   [0013](0013-redis-cache-aside-for-task-list.md) — generation-token list
-  cache; [0006](0006-postgres-task-persistence.md) — explicit SQL.
+  cache; [0006](0006-postgres-task-persistence.md) — explicit SQL;
+  [0019](0019-fifo-task-list-ordering.md) — FIFO `(created_at, id)` keyset.
 
 ## Context
 
