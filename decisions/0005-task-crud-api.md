@@ -7,6 +7,9 @@
 * Amends: [0004](0004-startup-errors-and-health-endpoint.md) — the database is
   required, startup verifies the schema, and health is split into readiness and
   liveness.
+* Later amendments: [0014](0014-task-filtering-and-pagination.md) — `GET /tasks`
+  gained filters, pagination, and a page envelope; create moved to `POST /task`
+  in a follow-up fix so the collection path stays read-oriented.
 
 ## Context
 
@@ -80,15 +83,22 @@ context while preserving them for `errors.Is`. It imports neither Gin nor
 
 ### HTTP contract
 
-`internal/task/handler` registers five routes on `gin.IRouter`:
+`internal/task/handler` registers five routes on `gin.IRouter`. The paths below
+are the **current** contract (create is not under the collection path; list is
+paginated — see [ADR 0014](0014-task-filtering-and-pagination.md)):
 
 | Method | Path | Success |
 | --- | --- | --- |
-| `POST` | `/tasks` | `201` with the created task and a `Location` header |
-| `GET` | `/tasks` | `200` with a JSON array, `[]` when empty |
+| `POST` | `/task` | `201` with the created task and a `Location: /tasks/{id}` header |
+| `GET` | `/tasks` | `200` with a page envelope (`items`, `page`, `page_size`, `total`, `total_pages`); `items` is `[]` when empty |
 | `GET` | `/tasks/:id` | `200` with the task |
 | `PUT` | `/tasks/:id` | `200` with the replaced task |
 | `DELETE` | `/tasks/:id` | `204` with no body |
+
+`POST /tasks` is not registered; an unsupported method on `/tasks` returns
+`405 method_not_allowed`. Filtering (`status`, `assignee`) and pagination
+(`page`, `page_size`) are defined in ADR 0014; this record retains the
+resource-level CRUD rules.
 
 Request bodies are decoded strictly: unknown fields, trailing content, wrong
 types, and empty bodies are `400 invalid_request`. Validation failures are
@@ -118,11 +128,14 @@ HTTP adapters, shared or feature-local, live in a `handler` package.
 (`HandleMethodNotAllowed`, `NoRoute`, `NoMethod`).
 
 `PUT` is a full replacement of the mutable fields: `title` is required,
-`description` is replaced (empty when omitted), and `status` defaults to `todo`
-when omitted, exactly as for creation. A missing ID is never upserted.
+`description` is replaced (empty when omitted), `status` defaults to `todo`
+when omitted, and `assignee` defaults to empty (unassigned), exactly as for
+creation. A missing ID is never upserted.
 
 List order is defined by the adapter: ascending `id`. The order is stable
 across calls but is not creation order; clients must not treat it as such.
+When the result is paginated, `total` / `total_pages` describe the filtered
+set before pagination (ADR 0014).
 
 ### PostgreSQL adapter
 
@@ -134,7 +147,7 @@ the adapter as given and only relies on its contract:
 - `Create` generates the identifier and returns the stored copy.
 - A missing row becomes `service.ErrNotFound`; malformed identifiers surface as
   decoding errors, not as not-found.
-- `List` returns a non-nil slice ordered by `id`.
+- `ListPage` returns one page ordered by `id` plus the filtered total (ADR 0014).
 - Every method returns freshly scanned values, so callers cannot mutate adapter
   state.
 
@@ -151,7 +164,8 @@ and handler tests use a hand-written repository double and need no database.
 2. The pool is pinged with a 5-second budget, then `database.VerifySchema`
    requires the `tasks` table. Either failure closes the pool and stops
    startup, so the process is never up but unable to serve a request.
-3. `postgres.New(pool)` → `service.New(repo)` → `handler.New(service, logger)`
+3. `postgres.New(pool)` → `service.New(repo, cache, logger)` → `handler.New(service, logger)`
+   (cache may be nil; Redis wiring is [ADR 0013](0013-redis-cache-aside-for-task-list.md))
    builds the task stack, and the handler is passed to `server.New` as a
    `RouteRegistrar`.
 

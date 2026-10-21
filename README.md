@@ -1154,12 +1154,14 @@ Mutations are refused against a non-loopback host unless
 
 ```bash
 # Warm: one query variant, cache primed by a short warmup, then measured.
+# Use Redis logical database /1 for benchmarks (distinct from the service
+# default /0 and from integration tests on /15) so keyspace counters are quiet.
 go run ./cmd/loadtest \
   -base-url http://127.0.0.1:8080 \
   -query 'page=1&page_size=20' \
   -requests 50000 -concurrency 16 -timeout 5s \
   -seed 2000 \
-  -redis-url redis://localhost:6379/0
+  -redis-url redis://localhost:6379/1
 
 # Cache-miss: every request must reach PostgreSQL.
 go run ./cmd/loadtest \
@@ -1167,7 +1169,7 @@ go run ./cmd/loadtest \
   -query 'page=1&page_size=20' \
   -mode miss -concurrency 1 -requests 1000 -timeout 5s \
   -seed 2000 \
-  -redis-url redis://localhost:6379/0
+  -redis-url redis://localhost:6379/1
 ```
 
 Flags: `-base-url`, `-query`, `-requests`, `-concurrency`, `-timeout`,
@@ -1226,8 +1228,10 @@ When `-redis-url` is supplied the tool reads Redis `keyspace_hits` and
   repopulate the cache and later requests would be hits.
 
 Redis counters are server-wide, so the numbers would include any other client
-of that Redis instance. The measurements above used a dedicated database (`/1`)
-and no other client traffic was generated during the measured phases.
+of that Redis instance. The measurements above used Redis logical database
+`/1` (the same database the commands above pass via `-redis-url`), not the
+service's habitual `/0` and not integration-test database `/15`, and no other
+client traffic was generated during the measured phases.
 
 **Profiling**
 
@@ -1241,14 +1245,14 @@ diagnostics.
 # run it with profiling enabled against a disposable database.
 make build
 export DATABASE_URL='postgres:///task_manager_bench?host=localhost&sslmode=disable'
-export REDIS_URL='redis://localhost:6379/0'
+export REDIS_URL='redis://localhost:6379/1'
 export PPROF_ADDR='127.0.0.1:6060'
 PORT=8080 ./task-manager
 
 # Terminal 2: start the capture, then generate load for at least as long.
 curl -sS -o cpu-warm.pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20' &
 go run ./cmd/loadtest -base-url http://127.0.0.1:8080 -requests 200000 -concurrency 16 \
-  -seed 2000 -redis-url redis://localhost:6379/0
+  -seed 2000 -redis-url redis://localhost:6379/1
 wait
 
 # Inspect the captured profile with the binary under test.
@@ -1297,7 +1301,8 @@ go tool pprof -top ./task-manager heap.pprof
   `max_connections=100`, and `fsync=on`; the service used its default pool
   (10 open, 5 idle).
 - Redis 7.4.11 in the Compose container (Linux VM, published on
-  `127.0.0.1:6379`, no `maxmemory`); the benchmark used database `1`.
+  `127.0.0.1:6379`, no `maxmemory`); the benchmark used logical database `/1`
+  for both `REDIS_URL` and `-redis-url` (not `/0`, not test DB `/15`).
 - Service run as a local process (not the container image) with default
   `LOG_LEVEL=info`, so per-request logging was active, on the same host as the
   load generator. Client and server therefore compete for the same cores.

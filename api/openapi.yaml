@@ -20,6 +20,13 @@ info:
     method on a health path still returns the envelope. Undefined methods on a
     known path return `405` with the `method_not_allowed` code, and unknown
     paths return `404` with the `not_found` code.
+
+    Every request carries an `X-Request-ID` correlation header. A valid incoming
+    value (1–64 characters of `[A-Za-z0-9][A-Za-z0-9._:-]*`) is propagated;
+    otherwise the server generates a random identifier. The same value is
+    echoed on the response. Prometheus metrics at `GET /metrics` are an
+    operational exposition endpoint (text format), not part of this JSON
+    contract — see the README and ADR 0010.
 security: []
 servers:
   - url: /
@@ -31,6 +38,8 @@ tags:
     description: Operational readiness and liveness probes.
 paths:
   /tasks:
+    parameters:
+      - $ref: '#/components/parameters/RequestIdHeader'
     get:
       tags:
         - Tasks
@@ -64,6 +73,9 @@ paths:
       responses:
         '200':
           description: One page of matching tasks and its pagination metadata.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
           content:
             application/json:
               schema:
@@ -110,6 +122,8 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
   /task:
+    parameters:
+      - $ref: '#/components/parameters/RequestIdHeader'
     post:
       tags:
         - Tasks
@@ -149,6 +163,8 @@ paths:
         '201':
           description: The task was created.
           headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
             Location:
               description: The path of the created task.
               schema:
@@ -175,6 +191,7 @@ paths:
           $ref: '#/components/responses/InternalError'
   /tasks/{id}:
     parameters:
+      - $ref: '#/components/parameters/RequestIdHeader'
       - $ref: '#/components/parameters/TaskId'
     get:
       tags:
@@ -185,6 +202,9 @@ paths:
       responses:
         '200':
           description: The requested task.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
           content:
             application/json:
               schema:
@@ -248,7 +268,38 @@ paths:
                     status: done
                     assignee: bob
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: |
+            The path identifier is not a UUID (same `validation_error` /
+            `invalid task id` body as GET and DELETE), or the request body is
+            malformed or fails field validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidId:
+                  summary: Malformed task ID
+                  value:
+                    error:
+                      code: validation_error
+                      message: invalid task id
+                      fields:
+                        id: must be a UUID
+                invalidJson:
+                  summary: Malformed JSON
+                  value:
+                    error:
+                      code: invalid_request
+                      message: request body must be a valid JSON object
+                validation:
+                  summary: Field validation failed
+                  value:
+                    error:
+                      code: validation_error
+                      message: invalid task data
+                      fields:
+                        title: title is required
+                        status: 'status must be one of "todo", "in_progress", "done"'
         '404':
           $ref: '#/components/responses/TaskNotFound'
         '405':
@@ -338,6 +389,21 @@ paths:
           $ref: '#/components/responses/MethodNotAllowed'
 components:
   parameters:
+    RequestIdHeader:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        Optional correlation identifier. Propagated when it matches
+        `^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`; otherwise the server generates a
+        new value. Echoed on every response. Applies to all routes, including
+        health and documentation.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
+        example: 6f1c2a4e8d3b4f5a9c7e1a2b3c4d5e6f
     TaskId:
       name: id
       in: path
@@ -396,6 +462,16 @@ components:
         maximum: 100
         default: 20
         example: 20
+  headers:
+    RequestId:
+      description: |
+        Correlation identifier for this request. Matches a valid incoming
+        `X-Request-ID` or a server-generated value.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+        example: 6f1c2a4e8d3b4f5a9c7e1a2b3c4d5e6f
   responses:
     BadRequest:
       description: |
@@ -420,7 +496,7 @@ components:
                   message: invalid task data
                   fields:
                     title: title is required
-                    status: 'status must be one of: todo, in_progress, done'
+                    status: 'status must be one of "todo", "in_progress", "done"'
             queryValidation:
               summary: Invalid query parameters
               value:

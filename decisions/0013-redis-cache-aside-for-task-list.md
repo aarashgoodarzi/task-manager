@@ -8,7 +8,9 @@
   consumer-owned interface rule; [0002](0002-package-layout-and-composition-root.md) —
   the composition root constructs the adapter; [0003](0003-postgres-via-database-sql.md) —
   PostgreSQL remains the source of truth; [0012](0012-consumer-owned-ports-dependency-audit.md) —
-  ports live with their consumers.
+  ports live with their consumers; [0014](0014-task-filtering-and-pagination.md) —
+  extends the list key with a per-query variant fingerprint under the same
+  generation token.
 
 ## Context
 
@@ -45,15 +47,17 @@ The requirements that shape the design are:
 
 ```go
 type ListCache interface {
-	Get(ctx context.Context) (ListSnapshot, error)
-	Set(ctx context.Context, snapshot ListSnapshot) error
+	Get(ctx context.Context, query ListQuery) (ListSnapshot, error)
+	Set(ctx context.Context, query ListQuery, snapshot ListSnapshot) error
 	Invalidate(ctx context.Context) error
 }
 ```
 
-`ListSnapshot` carries the cached tasks, the generation token observed by the
-read, and whether it was a hit. The token is opaque to the service; it exists
-only to bind a later `Set` to the generation the read actually saw.
+`ListSnapshot` carries the cached page (tasks plus pagination metadata), the
+generation token observed by the read, and whether it was a hit. The token is
+opaque to the service; it exists only to bind a later `Set` to the generation
+the read actually saw. The `ListQuery` argument selects which query variant is
+read or written ([ADR 0014](0014-task-filtering-and-pagination.md)).
 
 `internal/task/cache/redis` implements the port with `github.com/redis/go-redis/v9`.
 It is a driven adapter in the feature slice, not a generic cache framework, and
@@ -66,7 +70,12 @@ disables the feature without changing use-case behavior.
 | Key | Contents | TTL |
 | --- | --- | --- |
 | `task-manager:tasks:list:generation` | Current generation token (hex) | None |
-| `task-manager:tasks:list:<token>` | JSON `{"version":1,"tasks":[...]}` | `REDIS_CACHE_TTL`, default `60s` |
+| `task-manager:tasks:list:<token>:<variant>` | JSON page envelope (schema version 2) | `REDIS_CACHE_TTL`, default `60s` |
+
+`<variant>` is an 8-byte hex fingerprint of the normalized query
+(`status`, `assignee`, `page`, `page_size`). Equivalent requests share one
+entry; a mutation advances the generation so every variant becomes unreachable
+together ([ADR 0014](0014-task-filtering-and-pagination.md)).
 
 - The generation token is initialized with `SET NX` on the first read, so
   concurrent first readers converge on one token without a lock.
@@ -74,11 +83,12 @@ disables the feature without changing use-case behavior.
   default `60s`) bounds how long a cached list can survive a process that dies
   after a committed write but before invalidation. Zero, negative, and
   unparsable values fall back to `60s`; the adapter rejects non-positive TTLs.
-- An empty list is stored as `{"version":1,"tasks":[]}` and is a valid hit. It
-  is never treated as a miss or as `null`.
-- The payload version makes an incompatible future format a miss rather than a
-  speculative decode. Cached tasks use the domain struct's exported fields;
-  changing their JSON shape requires a schema-version bump.
+- An empty page is stored with `"tasks":[]` (and pagination metadata) and is a
+  valid hit. It is never treated as a miss or as `null`.
+- Schema version **2** carries `page`, `page_size`, `total`, and `total_pages`
+  alongside `tasks`. Version-1 payloads and corrupt JSON are treated as misses
+  after a compare-and-delete of the exact bytes observed, so a concurrent valid
+  refill is not removed and the service can repopulate immediately.
 
 ### Mutation invalidation
 
@@ -133,8 +143,10 @@ failed invalidation:
   cannot leave a stale list readable. Failure is logged and non-fatal.
 - **Read failure:** the service logs a warning and queries PostgreSQL.
 - **Write failure:** the service logs a warning and returns the database result.
-- **Malformed or version-mismatched payload:** the adapter returns an error;
-  the service falls back to PostgreSQL. The malformed entry is not returned.
+- **Malformed or version-mismatched payload:** the adapter discards the observed
+  value only when it is unchanged (compare-and-delete), reports a miss with the
+  observed generation token, and lets the service refill from PostgreSQL. The
+  poison entry is not returned as a hit.
 - **Invalidation failure:** the adapter marks itself degraded and reads report
   an error without calling Redis, so the service serves PostgreSQL. A
   rate-limited recovery probe then attempts a new generation at most once
@@ -224,12 +236,12 @@ misses.
   invalidates again. Correctness is preserved at the expense of hit rate.
 - **Cost:** the cache payload duplicates the domain field names. A future
   domain field change must bump the payload schema version or be additive.
-- **Limitation:** the design assumes one shared logical list. If filtering or
-  pagination is added, the single generation key is insufficient because
-  different query shapes must be invalidated too; that needs a new decision.
 - **Limitation:** Redis and PostgreSQL are not transactional. A commit can
   succeed and the process can die before invalidation; the startup reset and TTL
   bound that window but do not remove it entirely.
+- **Extension:** filtering and pagination (ADR 0014) keep one generation key and
+  add a per-query variant fingerprint under it. Invalidation still advances a
+  single token; it does not SCAN or delete individual variants.
 
 ## Consequences
 
