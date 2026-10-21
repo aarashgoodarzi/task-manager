@@ -179,9 +179,10 @@ without a compare-and-set or a Lua script, which this scope does not justify.
 The bound is `REDIS_CACHE_TTL` (default 60s), and Compose runs one API process,
 so the single-process case has no such window.
 
-Redis is a cache, not a source of truth. Compose disables RDB/AOF persistence
-and gives the service no Redis volume; losing all Redis data only causes
-misses.
+Redis is a cache, not a source of truth. Compose and CI both run
+`redis-server --save "" --appendonly no` (Compose via `command`, CI via
+service `entrypoint`/`command`) and give the service no Redis volume; losing
+all Redis data only causes misses.
 
 ## Alternatives considered
 
@@ -266,6 +267,10 @@ misses.
 - Cache behavior is covered by service unit tests with fakes, adapter unit
   tests for generation/failure logic, and real-Redis integration tests for
   expiration, invalidation, malformed payloads, concurrent first reads, and the
-  stale-refill ordering. CI asserts the Redis tests ran rather than skipping.
+  stale-refill ordering. CI provisions Redis with persistence disabled, runs
+  the suite under `TEST_REDIS_URL`, and asserts that `TestRedisCache` cases
+  report `--- PASS` (including miss-then-hit and stale-refill race) with no
+  `--- SKIP`, while preserving `go test`'s exit status so a failure cannot be
+  masked by the assertion greps.
 - If cache hit-rate metrics become necessary, they are a separate observability
   decision; this ADR does not add metrics to the existing Prometheus registry.

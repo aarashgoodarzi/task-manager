@@ -11,7 +11,11 @@ COVERAGE_PROFILE ?= coverage.out
 SWAGGER_READY_TIMEOUT ?= 60
 SWAGGER_UI_PATH       := /swagger/index.html
 
-.PHONY: build run app swagger-local migrate test test-integration coverage coverage-check vet fmt
+# OpenAPI contract lint (development-only; not a Go dependency). Pin matches
+# README / ADR 0009 so local and CI invoke the same Redocly CLI version.
+OPENAPI_LINT ?= npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml
+
+.PHONY: build run app swagger-local migrate test test-integration coverage coverage-check vet fmt openapi-lint
 
 # Optional local env file. The Go process does not read .env itself; these
 # targets source it when present so `make app` / `make swagger-local` work after
@@ -161,3 +165,7 @@ vet:
 
 fmt:
 	gofmt -l .
+
+# Validates api/openapi.yaml with the pinned Redocly CLI. Requires Node.js/npx.
+openapi-lint:
+	$(OPENAPI_LINT)

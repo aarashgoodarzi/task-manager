@@ -79,16 +79,19 @@ Unknown assets return `404` from the embedded file server.
 
 ### Validation and maintenance
 
-The document is validated with Redocly's OpenAPI linter:
+The document is validated with Redocly's OpenAPI linter. Locally and in CI the
+same Makefile target runs the pinned CLI:
 
 ```sh
-npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml
+make openapi-lint
+# equivalent: npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml
 ```
 
 This is a development-only tool; it is not a Go dependency and is not needed to
-build or run the service. Any change to a route, payload, status code, or header
-updates `api/openapi.yaml` in the same change. The handler tests remain the
-behavioral contract tests: the document describes the contract, it does not
+build or run the service. CI invokes `make openapi-lint` after `go build` so a
+broken contract fails the job. Any change to a route, payload, status code, or
+header updates `api/openapi.yaml` in the same change. The handler tests remain
+the behavioral contract tests: the document describes the contract, it does not
 generate handlers and it is not generated from them.
 
 There is deliberately no annotation or code-generation step. `swag`-style
@@ -150,4 +153,5 @@ small handwritten API depend on a generator for little gain.
   second documentation surface would be a new adapter, not a reason to couple
   feature handlers to Swagger UI.
 - The linter command and the contract's maintenance rule belong in the README
-  so a contributor does not need to infer them from this record.
+  and the Makefile (`make openapi-lint`); CI runs that target so contributors
+  do not need to remember a one-off `npx` invocation.

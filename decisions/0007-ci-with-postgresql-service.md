@@ -147,3 +147,25 @@ and extends this workflow:
 - The job also builds the Docker image, asserts that it runs as uid `10001`, and
   validates Compose with `docker compose config --quiet`.
 - No deployment, publishing, or push step is added.
+
+## Amendment: Redis service and hardened assertion steps
+
+[ADR 0013](0013-redis-cache-aside-for-task-list.md) added a real Redis cache
+adapter gated by `TEST_REDIS_URL`. The workflow now provisions Redis the same
+way it provisions PostgreSQL:
+
+- **Ephemeral Redis service.** `services.redis` uses `redis:7.4-alpine` with
+  `entrypoint: redis-server` and `command: --save "" --appendonly no`, matching
+  Compose so RDB snapshots and AOF are off for the job. A `redis-cli ping`
+  health check gates readiness; `TEST_REDIS_URL` points at logical database 15.
+- **No silent Redis skips.** After `make test-integration`, a dedicated step
+  reruns `-run 'TestRedisCache'` and requires `--- PASS` for
+  `TestRedisCacheMissThenHit` and `TestRedisCacheStaleRefillRace` while
+  rejecting any `--- SKIP`.
+- **Assertion steps preserve `go test` exit status.** Both the PostgreSQL and
+  Redis assertion steps use `set -euo pipefail`, pipe output through `tee`,
+  keep `PIPESTATUS[0]`, require the PASS lines, reject SKIP, then `exit` with
+  the original status so a sibling FAIL cannot be masked by greps.
+- **OpenAPI lint.** CI runs `make openapi-lint` (pinned Redocly CLI) so the
+  contract check documented in [ADR 0009](0009-openapi-contract.md) is enforced
+  on every run, not only locally.

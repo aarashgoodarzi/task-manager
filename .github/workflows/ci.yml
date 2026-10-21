@@ -39,9 +39,14 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       redis:
-        # Ephemeral cache only; persistence is disabled so every run starts
-        # empty and cannot leak state into the next run.
+        # Ephemeral cache only. Match Compose: disable RDB snapshots and AOF so
+        # the service never writes durable state during the job. The container
+        # itself is also discarded when the job ends.
         image: redis:7.4-alpine
+        # Same args as compose.yaml (`redis-server --save "" --appendonly no`).
+        # entrypoint overrides the image script so these flags reach redis-server.
+        entrypoint: redis-server
+        command: --save "" --appendonly no
         ports:
           - 6379:6379
         options: >-
@@ -89,6 +94,10 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # Same Redocly invocation as `make openapi-lint` / the README; no Go dep.
+      - name: Lint OpenAPI document
+        run: make openapi-lint
+
       # The infrastructure-free tier: both integration variables are cleared so
       # the adapter tests skip exactly as they do on a machine without them.
       - name: Unit tests (infrastructure-free)
@@ -108,30 +117,47 @@ jobs:
         run: make test-integration
 
       # A skip would still exit 0, so prove that the database-backed tests ran
-      # and passed rather than trusting the suite's exit status alone.
+      # and passed. Capture go test's exit status so a FAIL cannot be masked by
+      # later greps; required PASS lines and an anti-SKIP check still apply.
       - name: Assert PostgreSQL tests ran
         run: |
-          out=$(go test -count=1 -v -run 'TestCreatePersistsTask|TestMigrateIsIdempotent' ./internal/task/repository/postgres ./internal/infra/database)
-          printf '%s\n' "$out"
-          printf '%s\n' "$out" | grep -q -- '--- PASS: TestCreatePersistsTask'
-          printf '%s\n' "$out" | grep -q -- '--- PASS: TestMigrateIsIdempotent'
-          if printf '%s\n' "$out" | grep -q -- '--- SKIP'; then
+          set -euo pipefail
+          # Disable -e only around the pipeline so a failing go test does not
+          # abort before PASS/SKIP checks; PIPESTATUS must be read before any
+          # later command (including `|| true`) overwrites it.
+          set +e
+          go test -count=1 -v -run 'TestCreatePersistsTask|TestMigrateIsIdempotent' \
+            ./internal/task/repository/postgres ./internal/infra/database \
+            | tee /tmp/postgres-assert.out
+          status=${PIPESTATUS[0]}
+          set -e
+          grep -q -- '--- PASS: TestCreatePersistsTask' /tmp/postgres-assert.out
+          grep -q -- '--- PASS: TestMigrateIsIdempotent' /tmp/postgres-assert.out
+          if grep -q -- '--- SKIP' /tmp/postgres-assert.out; then
             echo "PostgreSQL integration tests were skipped despite TEST_DATABASE_URL being set" >&2
             exit 1
           fi
+          exit "${status}"
 
       # Redis tests skip without TEST_REDIS_URL, which would still exit 0. Prove
-      # the real-Redis tests ran and that none of them skipped.
+      # the real-Redis suite ran (full TestRedisCache selection), that the
+      # representative cases passed, that none skipped, and that go test itself
+      # exited 0 so a sibling FAIL cannot greenwash the step.
       - name: Assert Redis tests ran
         run: |
-          out=$(go test -count=1 -v -run 'TestRedisCache' ./internal/task/cache/redis)
-          printf '%s\n' "$out"
-          printf '%s\n' "$out" | grep -q -- '--- PASS: TestRedisCacheMissThenHit'
-          printf '%s\n' "$out" | grep -q -- '--- PASS: TestRedisCacheStaleRefillRace'
-          if printf '%s\n' "$out" | grep -q -- '--- SKIP'; then
+          set -euo pipefail
+          set +e
+          go test -count=1 -v -run 'TestRedisCache' ./internal/task/cache/redis \
+            | tee /tmp/redis-assert.out
+          status=${PIPESTATUS[0]}
+          set -e
+          grep -q -- '--- PASS: TestRedisCacheMissThenHit' /tmp/redis-assert.out
+          grep -q -- '--- PASS: TestRedisCacheStaleRefillRace' /tmp/redis-assert.out
+          if grep -q -- '--- SKIP' /tmp/redis-assert.out; then
             echo "Redis integration tests were skipped despite TEST_REDIS_URL being set" >&2
             exit 1
           fi
+          exit "${status}"
 
       # Packages share one database and Redis instance, so they run sequentially
       # (-p 1) to keep schema, table, and key state from interleaving.

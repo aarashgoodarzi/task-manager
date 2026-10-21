@@ -426,15 +426,18 @@ header change. It is hand-written and has no generation step. The task contract
 is recorded in [ADR 0005](decisions/0005-task-crud-api.md); the documentation
 artifact is recorded in [ADR 0009](decisions/0009-openapi-contract.md).
 
-Validate it with Redocly (Node.js/npm, development only):
+Validate it with Redocly (Node.js/npm, development only). Prefer the Makefile
+target so local and CI stay aligned:
 
 ```bash
-npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml
+make openapi-lint
+# equivalent: npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml
 ```
 
 The command fails on validation errors. The current document has one advisory
 warning because the `info` object has no `license`; the repository does not
-declare one. That warning does not make the document invalid.
+declare one. That warning does not make the document invalid. CI runs
+`make openapi-lint` on every workflow.
 
 ### Task endpoints
 
@@ -1084,7 +1087,7 @@ The configuration tests clear the variables they assert on, so a preset `PORT`,
 | Run the API locally (foreground) | `make app` or `make run` |
 | Migrate, run the API, and open Swagger UI | `make swagger-local` → runs `make migrate`, then opens <http://localhost:8080/swagger/index.html> |
 | Apply migrations only | `make migrate` or `go run ./cmd/migrate` |
-| Validate the OpenAPI document | `npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml` |
+| Validate the OpenAPI document | `make openapi-lint` (or `npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml`) |
 | Load-test `GET /tasks` | `go run ./cmd/loadtest -base-url http://127.0.0.1:8080 -seed 2000` |
 | Capture and inspect a CPU profile | See [Performance testing and profiling](#performance-testing-and-profiling) |
 
@@ -1368,19 +1371,22 @@ go tool pprof -top ./task-manager heap.pprof
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to `main`,
 every pull request, and manual dispatch. It provisions a real PostgreSQL service
 (`postgres:16.4-alpine`) with an ephemeral `task_manager_test` database and a
-throwaway Redis service (`redis:7.4-alpine`), then runs:
+throwaway Redis service (`redis:7.4-alpine` with RDB/AOF disabled, matching
+Compose), then runs:
 
 1. A formatting check that fails on any file `gofmt` would change.
 2. `go vet ./...` and `go build ./...`.
-3. Infrastructure-free tests with both integration URLs cleared.
-4. `go run ./cmd/migrate` with `DATABASE_URL`.
-5. `make test-integration` with `TEST_DATABASE_URL` and `TEST_REDIS_URL`.
-6. Assertions that representative PostgreSQL and Redis tests report `--- PASS`
-   and that no `--- SKIP` occurred.
-7. `go test -race -count=1 -p 1 ./...` against both services.
-8. `make coverage-check`, enforcing the 70% combined-suite threshold.
-9. A Docker image build, a non-root UID assertion, and
-   `docker compose config --quiet`.
+3. `make openapi-lint` (pinned Redocly CLI; same as local).
+4. Infrastructure-free tests with both integration URLs cleared.
+5. `go run ./cmd/migrate` with `DATABASE_URL`.
+6. `make test-integration` with `TEST_DATABASE_URL` and `TEST_REDIS_URL`.
+7. Assertions that representative PostgreSQL and Redis tests report `--- PASS`,
+   that no `--- SKIP` occurred, and that `go test` itself exited 0 (exit status
+   is preserved so a sibling failure cannot be masked by the greps).
+8. `go test -race -count=1 -p 1 ./...` against both services.
+9. `make coverage-check`, enforcing the 70% combined-suite threshold.
+10. A Docker image build, a non-root UID assertion, and
+    `docker compose config --quiet`.
 
 The workflow has read-only repository permissions, uses throwaway service
 credentials, and performs no deployment, publishing, or push.
