@@ -531,11 +531,14 @@ func TestListRepositoryFailureIsNotCached(t *testing.T) {
 	}
 }
 
-func TestListMalformedCacheFallsBackToRepository(t *testing.T) {
+func TestListPoisonCacheMissRefillsFromRepository(t *testing.T) {
+	// After the Redis adapter discards an invalid payload it returns a miss
+	// carrying the observed generation token. The service must refill so the
+	// next reader can hit again.
 	repo := newFakeRepo()
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "stored", Status: domain.StatusTodo}
 
-	cache := &fakeCache{getErr: errors.New("decode cached list: invalid character")}
+	cache := &fakeCache{snapshot: ListSnapshot{Token: "gen-poison"}}
 
 	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{})
 	if err != nil {
@@ -544,8 +547,11 @@ func TestListMalformedCacheFallsBackToRepository(t *testing.T) {
 	if len(result.Tasks) != 1 || result.Tasks[0].ID != "id-1" {
 		t.Fatalf("tasks = %+v, want the database list", result.Tasks)
 	}
-	if repo.listCalls != 1 {
-		t.Fatalf("repository List called %d times, want the fallback query", repo.listCalls)
+	if cache.setCalls != 1 {
+		t.Fatalf("cache Set called %d times, want a refill under the observed token", cache.setCalls)
+	}
+	if cache.lastSnapshot.Token != "gen-poison" {
+		t.Fatalf("stored token = %q, want gen-poison", cache.lastSnapshot.Token)
 	}
 }
 

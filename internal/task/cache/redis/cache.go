@@ -72,8 +72,22 @@ type store interface {
 	Get(ctx context.Context, key string) (string, error)
 	Set(ctx context.Context, key, value string, ttl time.Duration) error
 	SetNX(ctx context.Context, key, value string) (bool, error)
+	// CompareAndDelete removes key only when its current value still equals
+	// expected. It is the race-safe way to discard a poison payload without
+	// deleting a newer value written by a concurrent refill.
+	CompareAndDelete(ctx context.Context, key, expected string) (bool, error)
 	Close() error
 }
+
+// compareAndDeleteScript deletes a key only when its value is still the
+// exact bytes the caller observed. That keeps a concurrent Set of a valid
+// payload from being removed by a reader that saw an older poison value.
+var compareAndDeleteScript = goredis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
 
 type redisStore struct {
 	client *goredis.Client
@@ -89,6 +103,14 @@ func (s *redisStore) Set(ctx context.Context, key, value string, ttl time.Durati
 
 func (s *redisStore) SetNX(ctx context.Context, key, value string) (bool, error) {
 	return s.client.SetNX(ctx, key, value, 0).Result()
+}
+
+func (s *redisStore) CompareAndDelete(ctx context.Context, key, expected string) (bool, error) {
+	deleted, err := compareAndDeleteScript.Run(ctx, s.client, []string{key}, expected).Int64()
+	if err != nil {
+		return false, err
+	}
+	return deleted > 0, nil
 }
 
 func (s *redisStore) Close() error {
@@ -176,7 +198,8 @@ func (c *Cache) Get(ctx context.Context, query service.ListQuery) (service.ListS
 		return service.ListSnapshot{}, err
 	}
 
-	raw, err := c.store.Get(ctx, c.listKey(token, query))
+	key := c.listKey(token, query)
+	raw, err := c.store.Get(ctx, key)
 	if errors.Is(err, goredis.Nil) {
 		return service.ListSnapshot{Token: token}, nil
 	}
@@ -186,11 +209,16 @@ func (c *Cache) Get(ctx context.Context, query service.ListQuery) (service.ListS
 
 	var payload cachedList
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-		return service.ListSnapshot{Token: token}, fmt.Errorf("redis cache: decode list: %w", err)
+		// Treat corrupt JSON as a miss after a compare-and-delete of the
+		// exact bytes observed. Returning an error would leave the poison
+		// key in place (the service skips Set on Get errors) and force every
+		// subsequent reader through PostgreSQL until TTL expiry.
+		c.discardInvalidPayload(ctx, key, raw)
+		return service.ListSnapshot{Token: token}, nil
 	}
 	if payload.Version != cacheSchemaVersion {
-		return service.ListSnapshot{Token: token}, fmt.Errorf(
-			"redis cache: unsupported payload version %d", payload.Version)
+		c.discardInvalidPayload(ctx, key, raw)
+		return service.ListSnapshot{Token: token}, nil
 	}
 
 	tasks := payload.Tasks
@@ -211,6 +239,14 @@ func (c *Cache) Get(ctx context.Context, query service.ListQuery) (service.ListS
 		Token: token,
 		Hit:   true,
 	}, nil
+}
+
+// discardInvalidPayload removes a poison or wrong-version list entry only when
+// it is still the value this reader observed. A concurrent refill that already
+// wrote a valid payload under the same key is left alone. Failures are ignored:
+// the caller still reports a miss so the service can refill from PostgreSQL.
+func (c *Cache) discardInvalidPayload(ctx context.Context, key, observed string) {
+	_, _ = c.store.CompareAndDelete(ctx, key, observed)
 }
 
 // Set stores one query's page under the generation it was read from. If a

@@ -21,17 +21,24 @@ type fakeStore struct {
 	values map[string]string
 	ttls   map[string]time.Duration
 
-	getErr   error
-	setErr   error
-	setNXErr error
-	closeErr error
+	getErr              error
+	setErr              error
+	setNXErr            error
+	compareAndDeleteErr error
+	closeErr            error
 
 	setNXResult bool
 	closed      bool
 
-	getCalls   int
-	setCalls   int
-	setNXCalls int
+	getCalls              int
+	setCalls              int
+	setNXCalls            int
+	compareAndDeleteCalls int
+
+	// beforeCompareAndDelete runs after Get has observed a value and before
+	// CompareAndDelete decides whether to remove it. Tests use it to install a
+	// concurrent replacement without sleeps.
+	beforeCompareAndDelete func(key, expected string)
 }
 
 func newFakeStore() *fakeStore {
@@ -76,6 +83,23 @@ func (f *fakeStore) SetNX(_ context.Context, key, value string) (bool, error) {
 		return false, nil
 	}
 	f.values[key] = value
+	return true, nil
+}
+
+func (f *fakeStore) CompareAndDelete(_ context.Context, key, expected string) (bool, error) {
+	f.compareAndDeleteCalls++
+	if f.beforeCompareAndDelete != nil {
+		f.beforeCompareAndDelete(key, expected)
+	}
+	if f.compareAndDeleteErr != nil {
+		return false, f.compareAndDeleteErr
+	}
+	value, ok := f.values[key]
+	if !ok || value != expected {
+		return false, nil
+	}
+	delete(f.values, key)
+	delete(f.ttls, key)
 	return true, nil
 }
 
@@ -245,7 +269,7 @@ func TestGetHitEmptyPage(t *testing.T) {
 	}
 }
 
-func TestGetMalformedPayloadFallsBackWithError(t *testing.T) {
+func TestGetMalformedPayloadIsTreatedAsMissAndRemoved(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a")
 	query := defaultQuery()
@@ -254,21 +278,41 @@ func TestGetMalformedPayloadFallsBackWithError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
-	store.values[cache.listKey(miss.Token, query)] = "{not json"
+	key := cache.listKey(miss.Token, query)
+	store.values[key] = "{not json"
 
-	hit, err := cache.Get(context.Background(), query)
-	if err == nil {
-		t.Fatal("Get() with malformed JSON: want error, got nil")
+	got, err := cache.Get(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Get() with malformed JSON: unexpected error %v", err)
 	}
-	if hit.Hit {
+	if got.Hit {
 		t.Fatal("Get() reported a hit for malformed JSON")
 	}
-	if !strings.Contains(err.Error(), "decode list") {
-		t.Fatalf("error = %v, want a decode error", err)
+	if got.Token != miss.Token {
+		t.Fatalf("token = %q, want the observed generation %q so Set can refill", got.Token, miss.Token)
+	}
+	if store.compareAndDeleteCalls != 1 {
+		t.Fatalf("CompareAndDelete called %d times, want 1", store.compareAndDeleteCalls)
+	}
+	if _, ok := store.values[key]; ok {
+		t.Fatal("malformed payload was left in the store")
+	}
+
+	// A miss with a token lets the service refill; the next Get must then hit.
+	page := pageOf(domain.Task{ID: "id-1", Title: "task", Status: domain.StatusTodo})
+	if err := cache.Set(context.Background(), query, service.ListSnapshot{Result: page, Token: got.Token}); err != nil {
+		t.Fatalf("Set() after poison recovery: %v", err)
+	}
+	hit, err := cache.Get(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Get() after refill: %v", err)
+	}
+	if !hit.Hit || !samePage(hit.Result, page) {
+		t.Fatalf("Get() after refill = hit=%v result=%+v, want the refilled page", hit.Hit, hit.Result)
 	}
 }
 
-func TestGetUnsupportedPayloadVersionFallsBackWithError(t *testing.T) {
+func TestGetUnsupportedPayloadVersionIsTreatedAsMissAndRemoved(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a")
 	query := defaultQuery()
@@ -277,11 +321,97 @@ func TestGetUnsupportedPayloadVersionFallsBackWithError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
+	key := cache.listKey(miss.Token, query)
 	payload, _ := json.Marshal(cachedList{Version: cacheSchemaVersion + 1})
-	store.values[cache.listKey(miss.Token, query)] = string(payload)
+	store.values[key] = string(payload)
 
-	if _, err := cache.Get(context.Background(), query); err == nil {
-		t.Fatal("Get() with an unsupported version: want error, got nil")
+	got, err := cache.Get(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Get() with unsupported version: unexpected error %v", err)
+	}
+	if got.Hit {
+		t.Fatal("Get() reported a hit for an unsupported version")
+	}
+	if got.Token != miss.Token {
+		t.Fatalf("token = %q, want %q", got.Token, miss.Token)
+	}
+	if _, ok := store.values[key]; ok {
+		t.Fatal("unsupported-version payload was left in the store")
+	}
+}
+
+func TestGetInvalidPayloadDoesNotDeleteConcurrentReplacement(t *testing.T) {
+	store := newFakeStore()
+	cache := newTestCache(store, time.Minute, "gen-a")
+	query := defaultQuery()
+
+	miss, err := cache.Get(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	key := cache.listKey(miss.Token, query)
+	poison := "{not json"
+	store.values[key] = poison
+
+	valid, err := json.Marshal(cachedList{
+		Version:    cacheSchemaVersion,
+		Tasks:      []domain.Task{{ID: "id-1", Title: "fresh", Status: domain.StatusTodo}},
+		Page:       1,
+		PageSize:   service.DefaultPageSize,
+		Total:      1,
+		TotalPages: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal valid payload: %v", err)
+	}
+
+	// After this reader observed the poison value, a concurrent refill writes
+	// a valid payload under the same key. Compare-and-delete must leave it.
+	store.beforeCompareAndDelete = func(gotKey, expected string) {
+		if gotKey != key {
+			t.Fatalf("CompareAndDelete key = %q, want %q", gotKey, key)
+		}
+		if expected != poison {
+			t.Fatalf("CompareAndDelete expected = %q, want the observed poison", expected)
+		}
+		store.values[key] = string(valid)
+		store.ttls[key] = time.Minute
+	}
+
+	got, err := cache.Get(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	if got.Hit {
+		t.Fatal("Get() that observed poison must not report a hit")
+	}
+	if store.values[key] != string(valid) {
+		t.Fatalf("store value = %q, want the concurrent valid payload preserved", store.values[key])
+	}
+}
+
+func TestGetInvalidPayloadStillMissesWhenCompareAndDeleteFails(t *testing.T) {
+	store := newFakeStore()
+	cache := newTestCache(store, time.Minute, "gen-a")
+	query := defaultQuery()
+
+	miss, err := cache.Get(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	key := cache.listKey(miss.Token, query)
+	store.values[key] = "{not json"
+	store.compareAndDeleteErr = errors.New("redis unavailable")
+
+	got, err := cache.Get(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Get() must remain fail-open when discard fails: %v", err)
+	}
+	if got.Hit || got.Token != miss.Token {
+		t.Fatalf("Get() = %+v, want a miss carrying the observed token", got)
+	}
+	if store.values[key] != "{not json" {
+		t.Fatal("failed discard must not invent a deletion")
 	}
 }
 

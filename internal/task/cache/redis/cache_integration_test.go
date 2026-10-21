@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -299,7 +300,7 @@ func TestRedisCacheStaleRefillRace(t *testing.T) {
 	}
 }
 
-func TestRedisCacheMalformedValueFallsBackWithError(t *testing.T) {
+func TestRedisCacheMalformedValueIsMissAndAllowsRefill(t *testing.T) {
 	cache := newIntegrationCache(t, time.Minute)
 	ctx := context.Background()
 	query := service.ListQuery{Page: 1, PageSize: 20}
@@ -308,12 +309,93 @@ func TestRedisCacheMalformedValueFallsBackWithError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() miss: %v", err)
 	}
-	if err := cache.store.Set(ctx, cache.listKey(miss.Token, query), "{not json", time.Minute); err != nil {
+	key := cache.listKey(miss.Token, query)
+	if err := cache.store.Set(ctx, key, "{not json", time.Minute); err != nil {
 		t.Fatalf("write malformed value: %v", err)
 	}
 
-	if _, err := cache.Get(ctx, query); err == nil {
-		t.Fatal("Get() with malformed JSON: want error, got nil")
+	got, err := cache.Get(ctx, query)
+	if err != nil {
+		t.Fatalf("Get() with malformed JSON: unexpected error %v", err)
+	}
+	if got.Hit {
+		t.Fatal("Get() reported a hit for malformed JSON")
+	}
+	if got.Token != miss.Token {
+		t.Fatalf("token = %q, want %q", got.Token, miss.Token)
+	}
+	if _, err := cache.store.Get(ctx, key); !errors.Is(err, goredis.Nil) {
+		t.Fatalf("poison key still present after recovery: %v", err)
+	}
+
+	page := listPage([]domain.Task{{ID: "id-1", Title: "refilled", Status: domain.StatusTodo}}, 1, 1, 20)
+	if err := cache.Set(ctx, query, service.ListSnapshot{Result: page, Token: got.Token}); err != nil {
+		t.Fatalf("Set() after poison recovery: %v", err)
+	}
+	hit, err := cache.Get(ctx, query)
+	if err != nil || !hit.Hit || hit.Result.Tasks[0].Title != "refilled" {
+		t.Fatalf("Get() after refill = hit=%v err=%v result=%+v", hit.Hit, err, hit.Result)
+	}
+}
+
+func TestRedisCacheWrongVersionIsMissAndAllowsRefill(t *testing.T) {
+	cache := newIntegrationCache(t, time.Minute)
+	ctx := context.Background()
+	query := service.ListQuery{Page: 1, PageSize: 20}
+
+	miss, err := cache.Get(ctx, query)
+	if err != nil {
+		t.Fatalf("Get() miss: %v", err)
+	}
+	key := cache.listKey(miss.Token, query)
+	if err := cache.store.Set(ctx, key, `{"version":1,"tasks":[]}`, time.Minute); err != nil {
+		t.Fatalf("write wrong-version value: %v", err)
+	}
+
+	got, err := cache.Get(ctx, query)
+	if err != nil {
+		t.Fatalf("Get() with wrong version: unexpected error %v", err)
+	}
+	if got.Hit {
+		t.Fatal("Get() reported a hit for an unsupported version")
+	}
+	if _, err := cache.store.Get(ctx, key); !errors.Is(err, goredis.Nil) {
+		t.Fatalf("wrong-version key still present after recovery: %v", err)
+	}
+}
+
+func TestRedisCacheInvalidPayloadDoesNotDeleteConcurrentReplacement(t *testing.T) {
+	cache := newIntegrationCache(t, time.Minute)
+	ctx := context.Background()
+	query := service.ListQuery{Page: 1, PageSize: 20}
+
+	miss, err := cache.Get(ctx, query)
+	if err != nil {
+		t.Fatalf("Get() miss: %v", err)
+	}
+	key := cache.listKey(miss.Token, query)
+	poison := "{not json"
+	if err := cache.store.Set(ctx, key, poison, time.Minute); err != nil {
+		t.Fatalf("write poison: %v", err)
+	}
+
+	// Simulate the race the Lua script must win: another writer replaced the
+	// poison with a valid payload before compare-and-delete ran. Direct CAD
+	// against the observed poison must leave the replacement alone.
+	validPage := listPage([]domain.Task{{ID: "id-1", Title: "fresh", Status: domain.StatusTodo}}, 1, 1, 20)
+	if err := cache.Set(ctx, query, service.ListSnapshot{Result: validPage, Token: miss.Token}); err != nil {
+		t.Fatalf("concurrent Set: %v", err)
+	}
+	deleted, err := cache.store.CompareAndDelete(ctx, key, poison)
+	if err != nil {
+		t.Fatalf("CompareAndDelete: %v", err)
+	}
+	if deleted {
+		t.Fatal("CompareAndDelete removed a value that no longer matched the poison")
+	}
+	hit, err := cache.Get(ctx, query)
+	if err != nil || !hit.Hit || hit.Result.Tasks[0].Title != "fresh" {
+		t.Fatalf("Get() after preserved refill = hit=%v err=%v result=%+v", hit.Hit, err, hit.Result)
 	}
 }
 
