@@ -216,8 +216,27 @@ export REDIS_URL='redis://localhost:6379/0'
 export TEST_REDIS_URL='redis://localhost:6379/15'
 
 make migrate
-make run
+make app
 ```
+
+`make app` (equivalent to `make run`) starts the Go process in the foreground so
+logs stay visible. Stop it with `Ctrl+C`. To apply migrations, start the API,
+and open Swagger UI once the listener is ready, use a single command:
+
+```bash
+make swagger-local
+```
+
+That target runs `make migrate` first (the same non-destructive migrate
+workflow as the standalone target). If migrations fail, startup stops and the
+browser is not opened. On success it starts the API, waits until
+`GET /health/live`, `GET /swagger/openapi.yaml`, and the Swagger UI all succeed
+for this service, then opens <http://localhost:8080/swagger/index.html> (or the
+same path on `PORT` if you override it). If another process already owns the
+port, bind fails and the browser is not opened—use a free port, for example
+`PORT=9090 make swagger-local`. It does not start Docker Compose or reset the
+database; PostgreSQL must already be reachable via `DATABASE_URL`, and Redis
+remains optional. `make migrate` remains available on its own.
 
 The DSNs above use the current operating-system user with a local socket and
 TCP on `localhost`. For a password-protected server, use a full DSN such as:
@@ -358,17 +377,23 @@ edit it, then export it:
 ```bash
 cp .env.example .env
 # Edit DATABASE_URL and TEST_DATABASE_URL for your PostgreSQL instance.
-set -a && . ./.env && set +a
 make migrate
-make run
+make app
 ```
+
+`make app`, `make run`, `make swagger-local`, and `make migrate` source `.env`
+when that file exists (the Go binary still does not read `.env` on its own).
+You can also `export` the variables in your shell, or use
+`set -a && . ./.env && set +a` before other commands.
 
 `.env` is ignored by Git and must not be committed. The values in
 `.env.example` are placeholders; real credentials belong in your shell,
 Compose environment, or a secret manager. For a one-off override:
 
 ```bash
-PORT=9090 make run
+PORT=9090 make app
+# Swagger UI then opens at http://localhost:9090/swagger/index.html:
+PORT=9090 make swagger-local
 ```
 
 ## 5. API Reference
@@ -1041,7 +1066,9 @@ The configuration tests clear the variables they assert on, so a preset `PORT`,
 | Apply formatting | `gofmt -w .` |
 | Build the binary | `make build` or `go build -o task-manager ./cmd/task-manager` |
 | Compile every package | `go build ./...` |
-| Apply migrations | `make migrate` or `go run ./cmd/migrate` |
+| Run the API locally (foreground) | `make app` or `make run` |
+| Migrate, run the API, and open Swagger UI | `make swagger-local` → runs `make migrate`, then opens <http://localhost:8080/swagger/index.html> |
+| Apply migrations only | `make migrate` or `go run ./cmd/migrate` |
 | Validate the OpenAPI document | `npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml` |
 | Load-test `GET /tasks` | `go run ./cmd/loadtest -base-url http://127.0.0.1:8080 -seed 2000` |
 | Capture and inspect a CPU profile | See [Performance testing and profiling](#performance-testing-and-profiling) |

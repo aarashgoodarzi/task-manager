@@ -6,15 +6,108 @@ CMD    := ./cmd/task-manager
 COVERAGE_MIN     ?= 70
 COVERAGE_PROFILE ?= coverage.out
 
-.PHONY: build run migrate test test-integration coverage coverage-check vet fmt
+# Local Swagger helper (make swagger-local). Matches the default PORT and the
+# embedded UI path served by internal/infra/swagger.
+SWAGGER_READY_TIMEOUT ?= 60
+SWAGGER_UI_PATH       := /swagger/index.html
+
+.PHONY: build run app swagger-local migrate test test-integration coverage coverage-check vet fmt
+
+# Optional local env file. The Go process does not read .env itself; these
+# targets source it when present so `make app` / `make swagger-local` work after
+# `cp .env.example .env`. Already-set variables (e.g. PORT=9090 make ...) win
+# over values in .env. Keep as one line so the recipe stays a single shell.
+LOAD_DOTENV = if [ -f .env ]; then _port=$${PORT-}; _db=$${DATABASE_URL-}; _redis=$${REDIS_URL-}; set -a; . ./.env; set +a; [ -n "$$_port" ] && PORT=$$_port; [ -n "$$_db" ] && DATABASE_URL=$$_db; [ -n "$$_redis" ] && REDIS_URL=$$_redis; fi
 
 build:
 	go build -o $(BINARY) $(CMD)
 
-run:
+# Starts the API in the foreground (same as `make run`). Requires DATABASE_URL
+# and an applied schema; Redis is optional. See README §3 Option B.
+app:
+	@set -eu; \
+	$(LOAD_DOTENV); \
+	if [ -z "$${DATABASE_URL:-}" ]; then \
+		echo "app: DATABASE_URL is required." >&2; \
+		echo "  export DATABASE_URL='postgres:///task_manager?host=localhost&sslmode=disable'" >&2; \
+		echo "  # or: cp .env.example .env  # then edit DATABASE_URL and re-run" >&2; \
+		exit 1; \
+	fi; \
 	go run $(CMD)
 
+run: app
+
+# Runs `make migrate`, then starts the API in the foreground, waits until THIS
+# service's OpenAPI document and Swagger UI respond successfully, opens the UI,
+# and keeps the process attached. Polling only /health/live is not enough:
+# another process on the same port can return 200 while /swagger still 404s.
+# Migration failure aborts before startup. Ctrl+C stops the server. Honors PORT
+# (default 8080). Does not start Docker Compose or reset the database.
+swagger-local: migrate
+	@set -eu; \
+	$(LOAD_DOTENV); \
+	if [ -z "$${DATABASE_URL:-}" ]; then \
+		echo "swagger-local: DATABASE_URL is required." >&2; \
+		echo "  export DATABASE_URL='postgres:///task_manager?host=localhost&sslmode=disable'" >&2; \
+		echo "  # or: cp .env.example .env  # then edit DATABASE_URL and re-run" >&2; \
+		exit 1; \
+	fi; \
+	port="$${PORT:-8080}"; \
+	base="http://127.0.0.1:$${port}"; \
+	health="$${base}/health/live"; \
+	spec="$${base}/swagger/openapi.yaml"; \
+	swagger="$${base}$(SWAGGER_UI_PATH)"; \
+	timeout="$(SWAGGER_READY_TIMEOUT)"; \
+	shell_pid=$$$$; \
+	( \
+		i=0; \
+		while true; do \
+			if curl -sf "$$health" 2>/dev/null | grep -q '"status":"ok"' \
+				&& curl -sf "$$spec" 2>/dev/null | grep -q 'openapi:' \
+				&& curl -sf -o /dev/null -w '%{http_code}' "$$swagger" 2>/dev/null | grep -q '^200$$'; then \
+				break; \
+			fi; \
+			i=$$((i + 1)); \
+			if [ "$$i" -ge "$$timeout" ]; then \
+				echo "swagger-local: timed out after $${timeout}s waiting for $$swagger (is PORT $${port} free and the app running?)" >&2; \
+				kill -TERM "$$shell_pid" 2>/dev/null || true; \
+				exit 1; \
+			fi; \
+			sleep 1; \
+		done; \
+		echo "swagger-local: opening $$swagger"; \
+		case "$$(uname -s)" in \
+			Darwin) open "$$swagger" ;; \
+			Linux) \
+				if command -v xdg-open >/dev/null 2>&1; then xdg-open "$$swagger" >/dev/null 2>&1 || true; \
+				elif command -v sensible-browser >/dev/null 2>&1; then sensible-browser "$$swagger" >/dev/null 2>&1 || true; \
+				else echo "swagger-local: open $$swagger in your browser (no opener found)" >&2; \
+				fi ;; \
+			*) echo "swagger-local: open $$swagger in your browser" >&2 ;; \
+		esac; \
+	) & \
+	waiter=$$!; \
+	cleanup() { \
+		kill "$$waiter" 2>/dev/null || true; \
+		pkill -P "$$shell_pid" 2>/dev/null || true; \
+		wait "$$waiter" 2>/dev/null || true; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	go run $(CMD); \
+	status=$$?; \
+	trap - EXIT INT TERM; \
+	cleanup; \
+	exit "$$status"
+
 migrate:
+	@set -eu; \
+	$(LOAD_DOTENV); \
+	if [ -z "$${DATABASE_URL:-}" ]; then \
+		echo "migrate: DATABASE_URL is required." >&2; \
+		echo "  export DATABASE_URL='postgres:///task_manager?host=localhost&sslmode=disable'" >&2; \
+		echo "  # or: cp .env.example .env  # then edit DATABASE_URL and re-run" >&2; \
+		exit 1; \
+	fi; \
 	go run ./cmd/migrate
 
 test:
