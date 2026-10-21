@@ -85,6 +85,20 @@ func mustCreate(t *testing.T, r *Repository, title string) domain.Task {
 	return task
 }
 
+// allTasks is a filter that selects every task with a page large enough for
+// these tests, so tests that do not exercise pagination stay readable.
+var allTasks = service.Filter{Limit: 1000}
+
+func mustCreateWith(t *testing.T, r *Repository, task domain.Task) domain.Task {
+	t.Helper()
+
+	created, err := r.Create(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Create(%+v) unexpected error: %v", task, err)
+	}
+	return created
+}
+
 func countTasks(t *testing.T, db *sql.DB) int {
 	t.Helper()
 
@@ -202,15 +216,18 @@ func TestCreatePropagatesIDGenerationError(t *testing.T) {
 func TestListEmptyReturnsNonNilSlice(t *testing.T) {
 	repo, _ := newTestRepository(t)
 
-	tasks, err := repo.List(context.Background())
+	page, err := repo.ListPage(context.Background(), allTasks)
 	if err != nil {
-		t.Fatalf("List() unexpected error: %v", err)
+		t.Fatalf("ListPage() unexpected error: %v", err)
 	}
-	if tasks == nil {
-		t.Fatal("List() = nil, want an empty non-nil slice")
+	if page.Tasks == nil {
+		t.Fatal("ListPage() = nil, want an empty non-nil slice")
 	}
-	if len(tasks) != 0 {
-		t.Fatalf("len(tasks) = %d, want 0", len(tasks))
+	if len(page.Tasks) != 0 {
+		t.Fatalf("len(tasks) = %d, want 0", len(page.Tasks))
+	}
+	if page.Total != 0 {
+		t.Fatalf("Total = %d, want 0", page.Total)
 	}
 }
 
@@ -220,22 +237,22 @@ func TestListReturnsTasksOrderedByID(t *testing.T) {
 	first := mustCreate(t, repo, "first")
 	second := mustCreate(t, repo, "second")
 
-	tasks, err := repo.List(context.Background())
+	page, err := repo.ListPage(context.Background(), allTasks)
 	if err != nil {
-		t.Fatalf("List() unexpected error: %v", err)
+		t.Fatalf("ListPage() unexpected error: %v", err)
 	}
-	if len(tasks) != 2 {
-		t.Fatalf("len(tasks) = %d, want 2", len(tasks))
+	if len(page.Tasks) != 2 || page.Total != 2 {
+		t.Fatalf("page = %+v, want two tasks and a total of 2", page)
 	}
 
-	ids := []string{tasks[0].ID, tasks[1].ID}
+	ids := []string{page.Tasks[0].ID, page.Tasks[1].ID}
 	if !sort.StringsAreSorted(ids) {
 		t.Fatalf("IDs = %v, want ascending identifier order", ids)
 	}
 
-	byID := map[string]domain.Task{tasks[0].ID: tasks[0], tasks[1].ID: tasks[1]}
+	byID := map[string]domain.Task{page.Tasks[0].ID: page.Tasks[0], page.Tasks[1].ID: page.Tasks[1]}
 	if byID[first.ID] != first || byID[second.ID] != second {
-		t.Fatalf("List() = %+v, want the stored tasks", tasks)
+		t.Fatalf("ListPage() = %+v, want the stored tasks", page.Tasks)
 	}
 }
 
@@ -433,12 +450,12 @@ func TestConcurrentCreates(t *testing.T) {
 		unique[id] = struct{}{}
 	}
 
-	tasks, err := repo.List(context.Background())
+	page, err := repo.ListPage(context.Background(), allTasks)
 	if err != nil {
-		t.Fatalf("List() unexpected error: %v", err)
+		t.Fatalf("ListPage() unexpected error: %v", err)
 	}
-	if len(tasks) != workers {
-		t.Fatalf("len(tasks) = %d, want %d", len(tasks), workers)
+	if len(page.Tasks) != workers {
+		t.Fatalf("len(tasks) = %d, want %d", len(page.Tasks), workers)
 	}
 }
 
@@ -465,6 +482,18 @@ func TestSchemaConstraints(t *testing.T) {
 			        VALUES ($1::uuid, 'title', '', 'pending')`,
 			args: []any{"44444444-4444-4444-8444-444444444444"},
 		},
+		{
+			name: "blank assignee",
+			query: `INSERT INTO tasks (id, title, description, status, assignee)
+			        VALUES ($1::uuid, 'title', '', 'todo', '   ')`,
+			args: []any{"55555555-5555-4555-8555-555555555555"},
+		},
+		{
+			name: "assignee too long",
+			query: `INSERT INTO tasks (id, title, description, status, assignee)
+			        VALUES ($1::uuid, 'title', '', 'todo', repeat('a', 101))`,
+			args: []any{"66666666-6666-4666-8666-666666666666"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -473,5 +502,220 @@ func TestSchemaConstraints(t *testing.T) {
 				t.Fatal("INSERT succeeded, want a constraint violation")
 			}
 		})
+	}
+}
+
+func TestCreatePersistsAssignee(t *testing.T) {
+	repo, db := newTestRepository(t)
+
+	created := mustCreateWith(t, repo, domain.Task{
+		Title: "assigned", Status: domain.StatusTodo, Assignee: "alice",
+	})
+	if created.Assignee != "alice" {
+		t.Fatalf("Assignee = %q, want alice", created.Assignee)
+	}
+
+	var assignee sql.NullString
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT assignee FROM tasks WHERE id = $1::uuid`, created.ID,
+	).Scan(&assignee); err != nil {
+		t.Fatalf("read stored assignee: %v", err)
+	}
+	if !assignee.Valid || assignee.String != "alice" {
+		t.Fatalf("stored assignee = %+v, want alice", assignee)
+	}
+}
+
+// TestCreateStoresUnassignedAsNull pins the single representation of "no
+// assignee": the API returns "", the row stores NULL.
+func TestCreateStoresUnassignedAsNull(t *testing.T) {
+	repo, db := newTestRepository(t)
+
+	created := mustCreate(t, repo, "unassigned")
+	if created.Assignee != "" {
+		t.Fatalf("Assignee = %q, want empty", created.Assignee)
+	}
+
+	var assignee sql.NullString
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT assignee FROM tasks WHERE id = $1::uuid`, created.ID,
+	).Scan(&assignee); err != nil {
+		t.Fatalf("read stored assignee: %v", err)
+	}
+	if assignee.Valid {
+		t.Fatalf("stored assignee = %q, want NULL", assignee.String)
+	}
+}
+
+func TestUpdateChangesAssigneeAndCanClearIt(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	created := mustCreateWith(t, repo, domain.Task{
+		Title: "task", Status: domain.StatusTodo, Assignee: "alice",
+	})
+
+	updated, err := repo.Update(context.Background(), domain.Task{
+		ID: created.ID, Title: "task", Status: domain.StatusTodo, Assignee: "bob",
+	})
+	if err != nil {
+		t.Fatalf("Update() unexpected error: %v", err)
+	}
+	if updated.Assignee != "bob" {
+		t.Fatalf("Assignee = %q, want bob", updated.Assignee)
+	}
+
+	cleared, err := repo.Update(context.Background(), domain.Task{
+		ID: created.ID, Title: "task", Status: domain.StatusTodo,
+	})
+	if err != nil {
+		t.Fatalf("Update() clearing assignee: %v", err)
+	}
+	if cleared.Assignee != "" {
+		t.Fatalf("Assignee = %q, want it cleared", cleared.Assignee)
+	}
+}
+
+func TestListFiltersByStatus(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	todo := mustCreateWith(t, repo, domain.Task{Title: "todo", Status: domain.StatusTodo})
+	done := mustCreateWith(t, repo, domain.Task{Title: "done", Status: domain.StatusDone})
+	mustCreateWith(t, repo, domain.Task{Title: "busy", Status: domain.StatusInProgress})
+
+	for _, status := range []domain.Status{domain.StatusTodo, domain.StatusDone, domain.StatusInProgress} {
+		page, err := repo.ListPage(context.Background(), service.Filter{Status: status, Limit: 100})
+		if err != nil {
+			t.Fatalf("ListPage(status=%s) unexpected error: %v", status, err)
+		}
+		if page.Total != 1 || len(page.Tasks) != 1 {
+			t.Fatalf("status %s: page = %+v, want exactly one task", status, page)
+		}
+		if page.Tasks[0].Status != status {
+			t.Fatalf("status %s: returned task status %q", status, page.Tasks[0].Status)
+		}
+	}
+
+	page, err := repo.ListPage(context.Background(), service.Filter{Status: domain.StatusDone, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListPage(done) unexpected error: %v", err)
+	}
+	if page.Tasks[0].ID != done.ID || done.ID == todo.ID {
+		t.Fatalf("done filter returned %+v, want %s", page.Tasks, done.ID)
+	}
+}
+
+func TestListFiltersByAssignee(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	alice := mustCreateWith(t, repo, domain.Task{Title: "alice task", Status: domain.StatusTodo, Assignee: "alice"})
+	mustCreateWith(t, repo, domain.Task{Title: "bob task", Status: domain.StatusTodo, Assignee: "bob"})
+	mustCreate(t, repo, "unassigned")
+
+	page, err := repo.ListPage(context.Background(), service.Filter{Assignee: "alice", Limit: 100})
+	if err != nil {
+		t.Fatalf("ListPage() unexpected error: %v", err)
+	}
+	if page.Total != 1 || len(page.Tasks) != 1 || page.Tasks[0].ID != alice.ID {
+		t.Fatalf("page = %+v, want only alice's task", page)
+	}
+}
+
+func TestListCombinesFilters(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	mustCreateWith(t, repo, domain.Task{Title: "alice todo", Status: domain.StatusTodo, Assignee: "alice"})
+	want := mustCreateWith(t, repo, domain.Task{Title: "alice done", Status: domain.StatusDone, Assignee: "alice"})
+	mustCreateWith(t, repo, domain.Task{Title: "bob done", Status: domain.StatusDone, Assignee: "bob"})
+
+	page, err := repo.ListPage(context.Background(), service.Filter{
+		Status: domain.StatusDone, Assignee: "alice", Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("ListPage() unexpected error: %v", err)
+	}
+	if page.Total != 1 || len(page.Tasks) != 1 || page.Tasks[0].ID != want.ID {
+		t.Fatalf("page = %+v, want only alice's done task", page)
+	}
+}
+
+// TestListPaginatesDeterministically proves pages are ordered by id, do not
+// overlap, and each reports the same filtered total.
+func TestListPaginatesDeterministically(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	created := make(map[string]domain.Task, 5)
+	for _, title := range []string{"one", "two", "three", "four", "five"} {
+		task := mustCreate(t, repo, title)
+		created[task.ID] = task
+	}
+
+	seen := make(map[string]struct{}, 5)
+	var allIDs []string
+	for pageNumber, wantSize := range []int{2, 2, 1} {
+		page, err := repo.ListPage(context.Background(), service.Filter{
+			Limit: 2, Offset: int64(pageNumber * 2),
+		})
+		if err != nil {
+			t.Fatalf("ListPage(page %d) unexpected error: %v", pageNumber+1, err)
+		}
+		if page.Total != 5 {
+			t.Fatalf("page %d total = %d, want 5", pageNumber+1, page.Total)
+		}
+		if len(page.Tasks) != wantSize {
+			t.Fatalf("page %d has %d tasks, want %d", pageNumber+1, len(page.Tasks), wantSize)
+		}
+		for _, task := range page.Tasks {
+			if _, duplicate := seen[task.ID]; duplicate {
+				t.Fatalf("task %s appeared on two pages", task.ID)
+			}
+			seen[task.ID] = struct{}{}
+			allIDs = append(allIDs, task.ID)
+		}
+	}
+
+	if len(seen) != 5 {
+		t.Fatalf("pages covered %d tasks, want 5", len(seen))
+	}
+	if !sort.StringsAreSorted(allIDs) {
+		t.Fatalf("IDs = %v, want ascending identifier order across pages", allIDs)
+	}
+
+	last, err := repo.ListPage(context.Background(), service.Filter{Limit: 2, Offset: 4})
+	if err != nil {
+		t.Fatalf("ListPage(last page) unexpected error: %v", err)
+	}
+	if len(last.Tasks) != 1 || last.Total != 5 {
+		t.Fatalf("last page = %+v, want one task and total 5", last)
+	}
+}
+
+func TestListPageBeyondLastKeepsFilteredTotal(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	mustCreateWith(t, repo, domain.Task{Title: "todo", Status: domain.StatusTodo})
+	mustCreateWith(t, repo, domain.Task{Title: "done", Status: domain.StatusDone})
+
+	page, err := repo.ListPage(context.Background(), service.Filter{
+		Status: domain.StatusDone, Limit: 2, Offset: 50,
+	})
+	if err != nil {
+		t.Fatalf("ListPage() unexpected error: %v", err)
+	}
+	if page.Total != 1 {
+		t.Fatalf("Total = %d, want the filtered total 1", page.Total)
+	}
+	if page.Tasks == nil || len(page.Tasks) != 0 {
+		t.Fatalf("Tasks = %#v, want a non-nil empty page", page.Tasks)
+	}
+}
+
+// TestListFilterValuesAreBound proves the filter value is a SQL parameter, not
+// concatenated text: an injection-shaped assignee matches nothing.
+func TestListFilterValuesAreBound(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	mustCreateWith(t, repo, domain.Task{Title: "alice", Status: domain.StatusTodo, Assignee: "alice"})
+
+	page, err := repo.ListPage(context.Background(), service.Filter{
+		Assignee: "alice' OR '1'='1", Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("ListPage() unexpected error: %v", err)
+	}
+	if page.Total != 0 || len(page.Tasks) != 0 {
+		t.Fatalf("page = %+v, want no matches for a literal assignee", page)
 	}
 }

@@ -60,16 +60,35 @@ func (r *stubRepository) Create(_ context.Context, task domain.Task) (domain.Tas
 	return task, nil
 }
 
-func (r *stubRepository) List(_ context.Context) ([]domain.Task, error) {
+// ListPage mirrors the SQL adapter's contract: filter, order by ID, then slice,
+// with the total counted before pagination.
+func (r *stubRepository) ListPage(_ context.Context, filter service.Filter) (service.TaskPage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	tasks := make([]domain.Task, 0, len(r.tasks))
+	matched := make([]domain.Task, 0, len(r.tasks))
 	for _, task := range r.tasks {
-		tasks = append(tasks, task)
+		if filter.Status != "" && task.Status != filter.Status {
+			continue
+		}
+		if filter.Assignee != "" && task.Assignee != filter.Assignee {
+			continue
+		}
+		matched = append(matched, task)
 	}
-	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
-	return tasks, nil
+	sort.Slice(matched, func(i, j int) bool { return matched[i].ID < matched[j].ID })
+
+	total := int64(len(matched))
+	start := filter.Offset
+	if start > total {
+		start = total
+	}
+	end := start + int64(filter.Limit)
+	if end > total {
+		end = total
+	}
+
+	return service.TaskPage{Tasks: matched[int(start):int(end)], Total: total}, nil
 }
 
 func (r *stubRepository) Get(_ context.Context, id string) (domain.Task, error) {
@@ -133,13 +152,18 @@ func decodeTask(t *testing.T, rec *httptest.ResponseRecorder) taskResponse {
 	return task
 }
 
-func decodeTasks(t *testing.T, rec *httptest.ResponseRecorder) []taskResponse {
+func decodeList(t *testing.T, rec *httptest.ResponseRecorder) taskListResponse {
 	t.Helper()
-	var tasks []taskResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &tasks); err != nil {
+	var page taskListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 		t.Fatalf("decode task list: %v (body = %s)", err, rec.Body.String())
 	}
-	return tasks
+	return page
+}
+
+func decodeTasks(t *testing.T, rec *httptest.ResponseRecorder) []taskResponse {
+	t.Helper()
+	return decodeList(t, rec).Items
 }
 
 func decodeError(t *testing.T, rec *httptest.ResponseRecorder) infraHandler.Response {
@@ -290,8 +314,19 @@ func TestListTasksEmpty(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
 	}
-	if got := rec.Body.String(); got != "[]" {
-		t.Fatalf("body = %q, want an empty JSON array", got)
+
+	page := decodeList(t, rec)
+	if page.Items == nil || len(page.Items) != 0 {
+		t.Fatalf("items = %#v, want an empty array", page.Items)
+	}
+	if page.Page != 1 || page.PageSize != service.DefaultPageSize {
+		t.Fatalf("page = %d/%d, want defaults 1/%d", page.Page, page.PageSize, service.DefaultPageSize)
+	}
+	if page.Total != 0 || page.TotalPages != 0 {
+		t.Fatalf("total = %d, pages = %d; want 0/0", page.Total, page.TotalPages)
+	}
+	if strings.Contains(rec.Body.String(), `"items":null`) {
+		t.Fatalf("body = %s, want items encoded as []", rec.Body.String())
 	}
 }
 
@@ -310,7 +345,11 @@ func TestListTasksPopulated(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 
-	tasks := decodeTasks(t, rec)
+	page := decodeList(t, rec)
+	if page.Total != 2 || page.TotalPages != 1 {
+		t.Fatalf("total = %d, pages = %d; want 2/1", page.Total, page.TotalPages)
+	}
+	tasks := page.Items
 	if len(tasks) != 2 {
 		t.Fatalf("len(tasks) = %d, want 2", len(tasks))
 	}
@@ -468,6 +507,197 @@ func TestMalformedTaskID(t *testing.T) {
 	}
 }
 
+// createTask posts one task through the HTTP layer and returns the decoded
+// response, so list tests exercise the same write path clients use.
+func createTask(t *testing.T, router *gin.Engine, body string) taskResponse {
+	t.Helper()
+	rec := doRequest(router, http.MethodPost, "/task", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201, body = %s", rec.Code, rec.Body.String())
+	}
+	return decodeTask(t, rec)
+}
+
+func TestListTasksFiltersByStatus(t *testing.T) {
+	router := newTaskRouter()
+	createTask(t, router, `{"title":"todo one"}`)
+	createTask(t, router, `{"title":"in progress","status":"in_progress"}`)
+	createTask(t, router, `{"title":"done one","status":"done"}`)
+
+	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?status=in_progress", ""))
+	if page.Total != 1 || page.TotalPages != 1 {
+		t.Fatalf("total = %d, pages = %d; want 1/1", page.Total, page.TotalPages)
+	}
+	if len(page.Items) != 1 || page.Items[0].Title != "in progress" {
+		t.Fatalf("items = %+v, want only the in_progress task", page.Items)
+	}
+}
+
+func TestListTasksFiltersByAssignee(t *testing.T) {
+	router := newTaskRouter()
+	createTask(t, router, `{"title":"mine","assignee":"alice"}`)
+	createTask(t, router, `{"title":"theirs","assignee":"bob"}`)
+	createTask(t, router, `{"title":"nobody"}`)
+
+	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?assignee=alice", ""))
+	if page.Total != 1 {
+		t.Fatalf("total = %d, want 1", page.Total)
+	}
+	if len(page.Items) != 1 || page.Items[0].Title != "mine" || page.Items[0].Assignee != "alice" {
+		t.Fatalf("items = %+v, want only alice's task", page.Items)
+	}
+}
+
+func TestListTasksCombinesFilters(t *testing.T) {
+	router := newTaskRouter()
+	createTask(t, router, `{"title":"alice todo","assignee":"alice"}`)
+	createTask(t, router, `{"title":"alice done","assignee":"alice","status":"done"}`)
+	createTask(t, router, `{"title":"bob done","assignee":"bob","status":"done"}`)
+
+	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?status=done&assignee=alice", ""))
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Title != "alice done" {
+		t.Fatalf("page = %+v, want only alice's done task", page)
+	}
+}
+
+func TestListTasksPagination(t *testing.T) {
+	router := newTaskRouter()
+	for _, title := range []string{"one", "two", "three", "four", "five"} {
+		createTask(t, router, `{"title":"`+title+`"}`)
+	}
+
+	wantSizes := []int{2, 2, 1}
+	seen := make(map[string]struct{}, 5)
+	for index, wantSize := range wantSizes {
+		pageNumber := index + 1
+		page := decodeList(t, doRequest(router, http.MethodGet,
+			fmt.Sprintf("/tasks?page=%d&page_size=2", pageNumber), ""))
+
+		if page.Page != pageNumber || page.PageSize != 2 {
+			t.Fatalf("page = %d/%d, want %d/2", page.Page, page.PageSize, pageNumber)
+		}
+		if page.Total != 5 || page.TotalPages != 3 {
+			t.Fatalf("total = %d, pages = %d; want 5/3", page.Total, page.TotalPages)
+		}
+		if len(page.Items) != wantSize {
+			t.Fatalf("page %d has %d items, want %d", pageNumber, len(page.Items), wantSize)
+		}
+		for _, item := range page.Items {
+			if _, duplicate := seen[item.ID]; duplicate {
+				t.Fatalf("task %s appeared on more than one page", item.ID)
+			}
+			seen[item.ID] = struct{}{}
+		}
+	}
+
+	if len(seen) != 5 {
+		t.Fatalf("collected %d distinct tasks across three pages, want 5", len(seen))
+	}
+}
+
+func TestListTasksPageBeyondLastIsEmptyWithTotal(t *testing.T) {
+	router := newTaskRouter()
+	createTask(t, router, `{"title":"only"}`)
+
+	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?page=9&page_size=2", ""))
+	if page.Page != 9 || page.PageSize != 2 {
+		t.Fatalf("page = %d/%d, want the requested 9/2", page.Page, page.PageSize)
+	}
+	if page.Total != 1 || page.TotalPages != 1 {
+		t.Fatalf("total = %d, pages = %d; want the filtered total 1/1", page.Total, page.TotalPages)
+	}
+	if page.Items == nil || len(page.Items) != 0 {
+		t.Fatalf("items = %#v, want an empty array", page.Items)
+	}
+}
+
+func TestListTasksEmptyFilterResult(t *testing.T) {
+	router := newTaskRouter()
+	createTask(t, router, `{"title":"todo","assignee":"alice"}`)
+
+	page := decodeList(t, doRequest(router, http.MethodGet, "/tasks?status=done", ""))
+	if page.Total != 0 || page.TotalPages != 0 || len(page.Items) != 0 {
+		t.Fatalf("page = %+v, want an empty result with zero totals", page)
+	}
+}
+
+func TestListTasksAssigneeRoundTrip(t *testing.T) {
+	router := newTaskRouter()
+	created := createTask(t, router, `{"title":"owned","assignee":"  alice  "}`)
+
+	if created.Assignee != "alice" {
+		t.Fatalf("assignee = %q, want the trimmed label", created.Assignee)
+	}
+	fetched := decodeTask(t, doRequest(router, http.MethodGet, "/tasks/"+created.ID, ""))
+	if fetched.Assignee != "alice" {
+		t.Fatalf("fetched assignee = %q, want alice", fetched.Assignee)
+	}
+
+	rec := doRequest(router, http.MethodPut, "/tasks/"+created.ID,
+		`{"title":"reassigned","assignee":"bob"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d, want 200", rec.Code)
+	}
+	if updated := decodeTask(t, rec); updated.Assignee != "bob" {
+		t.Fatalf("updated assignee = %q, want bob", updated.Assignee)
+	}
+
+	// PUT is a full replacement: omitting assignee clears it.
+	rec = doRequest(router, http.MethodPut, "/tasks/"+created.ID, `{"title":"unassigned"}`)
+	if updated := decodeTask(t, rec); updated.Assignee != "" {
+		t.Fatalf("assignee = %q, want it cleared by replacement", updated.Assignee)
+	}
+}
+
+func TestListTasksRejectsInvalidQuery(t *testing.T) {
+	tests := []struct {
+		name   string
+		query  string
+		field  string
+		status int
+	}{
+		{name: "unknown status", query: "status=pending", field: "status"},
+		{name: "empty status", query: "status=", field: "status"},
+		{name: "empty assignee", query: "assignee=", field: "assignee"},
+		{name: "whitespace assignee", query: "assignee=%20%20", field: "assignee"},
+		{name: "page zero", query: "page=0", field: "page"},
+		{name: "negative page", query: "page=-1", field: "page"},
+		{name: "malformed page", query: "page=abc", field: "page"},
+		{name: "page overflow", query: "page=99999999999999999999", field: "page"},
+		{name: "huge page", query: "page=9223372036854775807", field: "page"},
+		{name: "page size zero", query: "page_size=0", field: "page_size"},
+		{name: "negative page size", query: "page_size=-5", field: "page_size"},
+		{name: "page size above maximum", query: "page_size=101", field: "page_size"},
+		{name: "malformed page size", query: "page_size=ten", field: "page_size"},
+		{name: "unknown parameter", query: "staus=todo", field: "staus"},
+	}
+
+	router := newTaskRouter()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doRequest(router, http.MethodGet, "/tasks?"+tc.query, "")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+			body := decodeError(t, rec)
+			if body.Error.Code != infraHandler.CodeValidationFailed {
+				t.Fatalf("code = %q, want %q", body.Error.Code, infraHandler.CodeValidationFailed)
+			}
+			if _, ok := body.Error.Fields[tc.field]; !ok {
+				t.Fatalf("fields = %v, want an entry for %q", body.Error.Fields, tc.field)
+			}
+		})
+	}
+}
+
+func TestListTasksAcceptsMaximumPageSize(t *testing.T) {
+	page := decodeList(t, doRequest(newTaskRouter(), http.MethodGet,
+		fmt.Sprintf("/tasks?page_size=%d", service.MaxPageSize), ""))
+	if page.PageSize != service.MaxPageSize {
+		t.Fatalf("page_size = %d, want %d", page.PageSize, service.MaxPageSize)
+	}
+}
+
 func TestTaskLifecycle(t *testing.T) {
 	router := newTaskRouter()
 
@@ -522,8 +752,8 @@ func (failingService) Create(context.Context, service.Input) (domain.Task, error
 	return domain.Task{}, errors.New("secret storage detail")
 }
 
-func (failingService) List(context.Context) ([]domain.Task, error) {
-	return nil, errors.New("secret storage detail")
+func (failingService) List(context.Context, service.ListQuery) (service.ListResult, error) {
+	return service.ListResult{}, errors.New("secret storage detail")
 }
 
 func (failingService) Get(context.Context, string) (domain.Task, error) {

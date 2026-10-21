@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/aarashgoodarzi/task-manager/internal/task/domain"
 	"github.com/aarashgoodarzi/task-manager/internal/task/service"
@@ -21,7 +22,7 @@ var _ service.Repository = (*Repository)(nil)
 
 // selectColumns keeps every read and RETURNING clause in one place, so scanning
 // stays consistent with the stored column order.
-const selectColumns = "id, title, description, status"
+const selectColumns = "id, title, description, status, assignee"
 
 // Repository persists tasks in the tasks table.
 type Repository struct {
@@ -50,11 +51,11 @@ func (r *Repository) Create(ctx context.Context, task domain.Task) (domain.Task,
 		}
 
 		stored, err := scanTask(r.db.QueryRowContext(ctx,
-			`INSERT INTO tasks (id, title, description, status)
-			 VALUES ($1::uuid, $2, $3, $4)
+			`INSERT INTO tasks (id, title, description, status, assignee)
+			 VALUES ($1::uuid, $2, $3, $4, $5)
 			 ON CONFLICT (id) DO NOTHING
 			 RETURNING `+selectColumns,
-			id, task.Title, task.Description, string(task.Status),
+			id, task.Title, task.Description, string(task.Status), nullableAssignee(task.Assignee),
 		))
 		if errors.Is(err, sql.ErrNoRows) {
 			continue // the generated identifier exists; try another one
@@ -68,13 +69,36 @@ func (r *Repository) Create(ctx context.Context, task domain.Task) (domain.Task,
 	return domain.Task{}, fmt.Errorf("postgres: could not generate a unique task id in %d attempts", maxIDAttempts)
 }
 
-// List returns every task ordered by identifier, which makes the response
-// stable across calls.
-func (r *Repository) List(ctx context.Context) ([]domain.Task, error) {
+// ListPage returns one page of tasks matching filter, ordered by identifier,
+// together with the total number of matching tasks before pagination.
+//
+// Filtering, ordering, and pagination all happen in PostgreSQL: the adapter
+// never loads the collection to slice it in memory. The count and the page use
+// the same WHERE clause builder, so their semantics cannot drift apart.
+func (r *Repository) ListPage(ctx context.Context, filter service.Filter) (service.TaskPage, error) {
+	if r.db == nil {
+		return service.TaskPage{}, fmt.Errorf("postgres: list tasks: nil pool")
+	}
+
+	where, args := filterClause(filter)
+
+	var total int64
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM tasks`+where, args...).Scan(&total); err != nil {
+		return service.TaskPage{}, fmt.Errorf("postgres: count tasks: %w", err)
+	}
+
+	// LIMIT and OFFSET are bound as parameters, like every other value in this
+	// adapter, so no user input is ever interpolated into SQL.
+	pageArgs := make([]any, 0, len(args)+2)
+	pageArgs = append(pageArgs, args...)
+	pageArgs = append(pageArgs, filter.Limit, filter.Offset)
+
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT `+selectColumns+` FROM tasks ORDER BY id`)
+		`SELECT `+selectColumns+` FROM tasks`+where+
+			fmt.Sprintf(` ORDER BY id LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2),
+		pageArgs...)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: list tasks: %w", err)
+		return service.TaskPage{}, fmt.Errorf("postgres: list tasks: %w", err)
 	}
 	defer rows.Close()
 
@@ -82,14 +106,36 @@ func (r *Repository) List(ctx context.Context) ([]domain.Task, error) {
 	for rows.Next() {
 		task, err := scanTask(rows)
 		if err != nil {
-			return nil, fmt.Errorf("postgres: list tasks: %w", err)
+			return service.TaskPage{}, fmt.Errorf("postgres: list tasks: %w", err)
 		}
 		tasks = append(tasks, task)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("postgres: list tasks: %w", err)
+		return service.TaskPage{}, fmt.Errorf("postgres: list tasks: %w", err)
 	}
-	return tasks, nil
+
+	return service.TaskPage{Tasks: tasks, Total: total}, nil
+}
+
+// filterClause builds the shared WHERE clause for the count and page queries.
+// Values are always bound as parameters; the placeholder numbers follow the
+// argument order so the two queries cannot disagree about which value is which.
+func filterClause(filter service.Filter) (string, []any) {
+	conditions := make([]string, 0, 2)
+	args := make([]any, 0, 2)
+
+	if filter.Status != "" {
+		args = append(args, string(filter.Status))
+		conditions = append(conditions, fmt.Sprintf("status = $%d", len(args)))
+	}
+	if filter.Assignee != "" {
+		args = append(args, filter.Assignee)
+		conditions = append(conditions, fmt.Sprintf("assignee = $%d", len(args)))
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(conditions, " AND "), args
 }
 
 // CountTasks returns the number of rows currently in the tasks table. It is a
@@ -127,10 +173,10 @@ func (r *Repository) Get(ctx context.Context, id string) (domain.Task, error) {
 func (r *Repository) Update(ctx context.Context, task domain.Task) (domain.Task, error) {
 	updated, err := scanTask(r.db.QueryRowContext(ctx,
 		`UPDATE tasks
-		 SET title = $2, description = $3, status = $4
+		 SET title = $2, description = $3, status = $4, assignee = $5
 		 WHERE id = $1::uuid
 		 RETURNING `+selectColumns,
-		task.ID, task.Title, task.Description, string(task.Status),
+		task.ID, task.Title, task.Description, string(task.Status), nullableAssignee(task.Assignee),
 	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Task{}, service.ErrNotFound
@@ -159,6 +205,15 @@ func (r *Repository) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// nullableAssignee maps the domain's "empty means unassigned" rule onto SQL
+// NULL, so an unassigned task has exactly one stored representation.
+func nullableAssignee(assignee string) any {
+	if assignee == "" {
+		return nil
+	}
+	return assignee
+}
+
 // scanner is the subset of *sql.Row and *sql.Rows that scanTask needs.
 type scanner interface {
 	Scan(dest ...any) error
@@ -168,12 +223,14 @@ type scanner interface {
 // back into the domain type.
 func scanTask(row scanner) (domain.Task, error) {
 	var (
-		task   domain.Task
-		status string
+		task     domain.Task
+		status   string
+		assignee sql.NullString
 	)
-	if err := row.Scan(&task.ID, &task.Title, &task.Description, &status); err != nil {
+	if err := row.Scan(&task.ID, &task.Title, &task.Description, &status, &assignee); err != nil {
 		return domain.Task{}, err
 	}
 	task.Status = domain.Status(status)
+	task.Assignee = assignee.String
 	return task, nil
 }

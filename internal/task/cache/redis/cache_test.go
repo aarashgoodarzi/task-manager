@@ -104,6 +104,39 @@ func newTestCache(store store, ttl time.Duration, tokens ...string) *Cache {
 	}
 }
 
+// defaultQuery is the query the service produces for a request with no
+// parameters, which most tests exercise.
+func defaultQuery() service.ListQuery {
+	return service.ListQuery{Page: 1, PageSize: service.DefaultPageSize}
+}
+
+// samePage compares two cached pages field by field; ListResult holds a slice
+// and is therefore not comparable.
+func samePage(a, b service.ListResult) bool {
+	if a.Page != b.Page || a.PageSize != b.PageSize || a.Total != b.Total || a.TotalPages != b.TotalPages {
+		return false
+	}
+	if len(a.Tasks) != len(b.Tasks) {
+		return false
+	}
+	for i := range a.Tasks {
+		if a.Tasks[i] != b.Tasks[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func pageOf(tasks ...domain.Task) service.ListResult {
+	return service.ListResult{
+		Tasks:      tasks,
+		Page:       1,
+		PageSize:   service.DefaultPageSize,
+		Total:      int64(len(tasks)),
+		TotalPages: 1,
+	}
+}
+
 func TestNewValidatesConfig(t *testing.T) {
 	if _, err := New(Config{TTL: time.Minute}); err == nil {
 		t.Fatal("New() without URL: want error, got nil")
@@ -128,7 +161,7 @@ func TestGetMissInitializesGeneration(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a")
 
-	snapshot, err := cache.Get(context.Background())
+	snapshot, err := cache.Get(context.Background(), defaultQuery())
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
@@ -149,73 +182,81 @@ func TestGetMissInitializesGeneration(t *testing.T) {
 func TestGetHitRoundTrip(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a")
+	query := defaultQuery()
 
-	miss, err := cache.Get(context.Background())
+	miss, err := cache.Get(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
 
 	tasks := []domain.Task{
-		{ID: "id-1", Title: "first", Description: "one", Status: domain.StatusTodo},
+		{ID: "id-1", Title: "first", Description: "one", Status: domain.StatusTodo, Assignee: "alice"},
 		{ID: "id-2", Title: "second", Description: "", Status: domain.StatusDone},
 	}
-	if err := cache.Set(context.Background(), service.ListSnapshot{Tasks: tasks, Token: miss.Token}); err != nil {
+	result := service.ListResult{Tasks: tasks, Page: 1, PageSize: 20, Total: 2, TotalPages: 1}
+	if err := cache.Set(context.Background(), query, service.ListSnapshot{Result: result, Token: miss.Token}); err != nil {
 		t.Fatalf("Set() unexpected error: %v", err)
 	}
 
-	hit, err := cache.Get(context.Background())
+	hit, err := cache.Get(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
 	if !hit.Hit {
 		t.Fatal("Get() missed after Set()")
 	}
-	if len(hit.Tasks) != 2 || hit.Tasks[0] != tasks[0] || hit.Tasks[1] != tasks[1] {
-		t.Fatalf("tasks = %+v, want %+v", hit.Tasks, tasks)
+	if len(hit.Result.Tasks) != 2 || hit.Result.Tasks[0] != tasks[0] || hit.Result.Tasks[1] != tasks[1] {
+		t.Fatalf("tasks = %+v, want %+v", hit.Result.Tasks, tasks)
+	}
+	if !samePage(hit.Result, result) {
+		t.Fatalf("result = %+v, want the cached page metadata %+v", hit.Result, result)
 	}
 	if hit.Token != miss.Token {
 		t.Fatalf("token = %q, want %q", hit.Token, miss.Token)
 	}
 }
 
-func TestGetHitEmptyList(t *testing.T) {
+func TestGetHitEmptyPage(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a")
+	query := defaultQuery()
 
-	miss, err := cache.Get(context.Background())
+	miss, err := cache.Get(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
-	if err := cache.Set(context.Background(), service.ListSnapshot{
-		Tasks: []domain.Task{},
-		Token: miss.Token,
-	}); err != nil {
+	result := service.ListResult{Tasks: []domain.Task{}, Page: 2, PageSize: 10, Total: 4, TotalPages: 1}
+	if err := cache.Set(context.Background(), query, service.ListSnapshot{Result: result, Token: miss.Token}); err != nil {
 		t.Fatalf("Set() unexpected error: %v", err)
 	}
 
-	hit, err := cache.Get(context.Background())
+	hit, err := cache.Get(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
 	if !hit.Hit {
-		t.Fatal("empty list was not treated as a hit")
+		t.Fatal("empty page was not treated as a hit")
 	}
-	if hit.Tasks == nil || len(hit.Tasks) != 0 {
-		t.Fatalf("tasks = %#v, want a non-nil empty list", hit.Tasks)
+	if hit.Result.Tasks == nil || len(hit.Result.Tasks) != 0 {
+		t.Fatalf("tasks = %#v, want a non-nil empty page", hit.Result.Tasks)
+	}
+	if hit.Result.Total != 4 || hit.Result.TotalPages != 1 {
+		t.Fatalf("result = %+v, want the cached total metadata", hit.Result)
 	}
 }
 
 func TestGetMalformedPayloadFallsBackWithError(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a")
+	query := defaultQuery()
 
-	miss, err := cache.Get(context.Background())
+	miss, err := cache.Get(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
-	store.values[cache.listKey(miss.Token)] = "{not json"
+	store.values[cache.listKey(miss.Token, query)] = "{not json"
 
-	hit, err := cache.Get(context.Background())
+	hit, err := cache.Get(context.Background(), query)
 	if err == nil {
 		t.Fatal("Get() with malformed JSON: want error, got nil")
 	}
@@ -230,15 +271,16 @@ func TestGetMalformedPayloadFallsBackWithError(t *testing.T) {
 func TestGetUnsupportedPayloadVersionFallsBackWithError(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a")
+	query := defaultQuery()
 
-	miss, err := cache.Get(context.Background())
+	miss, err := cache.Get(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
 	payload, _ := json.Marshal(cachedList{Version: cacheSchemaVersion + 1})
-	store.values[cache.listKey(miss.Token)] = string(payload)
+	store.values[cache.listKey(miss.Token, query)] = string(payload)
 
-	if _, err := cache.Get(context.Background()); err == nil {
+	if _, err := cache.Get(context.Background(), query); err == nil {
 		t.Fatal("Get() with an unsupported version: want error, got nil")
 	}
 }
@@ -246,7 +288,7 @@ func TestGetUnsupportedPayloadVersionFallsBackWithError(t *testing.T) {
 func TestSetRejectsMissingToken(t *testing.T) {
 	cache := newTestCache(newFakeStore(), time.Minute, "gen-a")
 
-	if err := cache.Set(context.Background(), service.ListSnapshot{}); err == nil {
+	if err := cache.Set(context.Background(), defaultQuery(), service.ListSnapshot{}); err == nil {
 		t.Fatal("Set() without a token: want error, got nil")
 	}
 }
@@ -254,17 +296,21 @@ func TestSetRejectsMissingToken(t *testing.T) {
 func TestSetUsesConfiguredTTLAndKeyLayout(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, 90*time.Second, "gen-a")
+	query := defaultQuery()
 
-	if err := cache.Set(context.Background(), service.ListSnapshot{
-		Tasks: []domain.Task{{ID: "id-1", Title: "task", Status: domain.StatusTodo}},
-		Token: "gen-a",
+	if err := cache.Set(context.Background(), query, service.ListSnapshot{
+		Result: pageOf(domain.Task{ID: "id-1", Title: "task", Status: domain.StatusTodo}),
+		Token:  "gen-a",
 	}); err != nil {
 		t.Fatalf("Set() unexpected error: %v", err)
 	}
 
-	key := "test:tasks:list:gen-a"
+	key := cache.listKey("gen-a", query)
 	if _, ok := store.values[key]; !ok {
-		t.Fatalf("value keys = %v, want %q", store.values, key)
+		t.Fatalf("value keys = %v, want a variant key under the generation", store.values)
+	}
+	if !strings.HasPrefix(key, "test:tasks:list:gen-a:") {
+		t.Fatalf("key = %q, want the documented generation/variant layout", key)
 	}
 	if got := store.ttls[key]; got != 90*time.Second {
 		t.Fatalf("TTL = %v, want 90s", got)
@@ -277,20 +323,142 @@ func TestSetUsesConfiguredTTLAndKeyLayout(t *testing.T) {
 	if payload.Version != cacheSchemaVersion || len(payload.Tasks) != 1 {
 		t.Fatalf("payload = %+v, want version %d with one task", payload, cacheSchemaVersion)
 	}
+	if payload.Page != 1 || payload.PageSize != service.DefaultPageSize || payload.Total != 1 || payload.TotalPages != 1 {
+		t.Fatalf("payload = %+v, want the pagination metadata", payload)
+	}
+}
+
+// TestVariantKeysAreDistinct proves that every response-affecting parameter
+// names its own entry, so one query can never answer another.
+func TestVariantKeysAreDistinct(t *testing.T) {
+	base := defaultQuery()
+
+	queries := map[string]service.ListQuery{
+		"base":           base,
+		"status todo":    {Status: domain.StatusTodo, Page: 1, PageSize: 20},
+		"status done":    {Status: domain.StatusDone, Page: 1, PageSize: 20},
+		"assignee alice": {Assignee: "alice", Page: 1, PageSize: 20},
+		"assignee bob":   {Assignee: "bob", Page: 1, PageSize: 20},
+		"page 2":         {Page: 2, PageSize: 20},
+		"page size 10":   {Page: 1, PageSize: 10},
+		"both filters":   {Status: domain.StatusDone, Assignee: "alice", Page: 1, PageSize: 20},
+	}
+
+	seen := make(map[string]string, len(queries))
+	for name, query := range queries {
+		key := variantKey(query)
+		if existing, duplicate := seen[key]; duplicate {
+			t.Fatalf("%q and %q share cache key %q", existing, name, key)
+		}
+		seen[key] = name
+	}
+}
+
+// TestVariantKeyIsStableForEquivalentQueries pins normalization: the same
+// effective query must reuse one entry, so the defaults cannot double the cache.
+func TestVariantKeyIsStableForEquivalentQueries(t *testing.T) {
+	cache := newTestCache(newFakeStore(), time.Minute, "gen-a")
+
+	defaultKey := cache.listKey("gen-a", defaultQuery())
+	explicitKey := cache.listKey("gen-a", service.ListQuery{Page: 1, PageSize: service.DefaultPageSize})
+	if defaultKey != explicitKey {
+		t.Fatalf("keys differ for equivalent queries: %q vs %q", defaultKey, explicitKey)
+	}
+}
+
+func TestVariantsAreIndependent(t *testing.T) {
+	store := newFakeStore()
+	cache := newTestCache(store, time.Minute, "gen-a")
+	ctx := context.Background()
+
+	aliceQuery := service.ListQuery{Assignee: "alice", Page: 1, PageSize: 20}
+	bobQuery := service.ListQuery{Assignee: "bob", Page: 1, PageSize: 20}
+
+	miss, err := cache.Get(ctx, aliceQuery)
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	if err := cache.Set(ctx, aliceQuery, service.ListSnapshot{
+		Result: service.ListResult{
+			Tasks: []domain.Task{{ID: "alice-task", Title: "alice", Assignee: "alice", Status: domain.StatusTodo}},
+			Page:  1, PageSize: 20, Total: 1, TotalPages: 1,
+		},
+		Token: miss.Token,
+	}); err != nil {
+		t.Fatalf("Set() unexpected error: %v", err)
+	}
+
+	aliceHit, err := cache.Get(ctx, aliceQuery)
+	if err != nil {
+		t.Fatalf("Get(alice) unexpected error: %v", err)
+	}
+	if !aliceHit.Hit || aliceHit.Result.Tasks[0].ID != "alice-task" {
+		t.Fatalf("alice page = %+v, want the cached alice task", aliceHit.Result)
+	}
+
+	bobMiss, err := cache.Get(ctx, bobQuery)
+	if err != nil {
+		t.Fatalf("Get(bob) unexpected error: %v", err)
+	}
+	if bobMiss.Hit {
+		t.Fatalf("bob query hit alice's cached page: %+v", bobMiss.Result)
+	}
+	if bobMiss.Result.Tasks != nil {
+		t.Fatalf("miss carried tasks: %+v", bobMiss.Result.Tasks)
+	}
+}
+
+// TestInvalidationHidesEveryVariant proves one mutation invalidates the whole
+// family of query entries, not just the one that happens to be at hand.
+func TestInvalidationHidesEveryVariant(t *testing.T) {
+	store := newFakeStore()
+	cache := newTestCache(store, time.Minute, "gen-a", "gen-b")
+	ctx := context.Background()
+
+	queries := []service.ListQuery{
+		{Page: 1, PageSize: 20},
+		{Status: domain.StatusDone, Page: 1, PageSize: 20},
+		{Assignee: "alice", Page: 2, PageSize: 5},
+	}
+
+	for _, query := range queries {
+		miss, err := cache.Get(ctx, query)
+		if err != nil {
+			t.Fatalf("Get() unexpected error: %v", err)
+		}
+		if err := cache.Set(ctx, query, service.ListSnapshot{Result: pageOf(), Token: miss.Token}); err != nil {
+			t.Fatalf("Set() unexpected error: %v", err)
+		}
+	}
+
+	if err := cache.Invalidate(ctx); err != nil {
+		t.Fatalf("Invalidate() unexpected error: %v", err)
+	}
+
+	for _, query := range queries {
+		hit, err := cache.Get(ctx, query)
+		if err != nil {
+			t.Fatalf("Get() after invalidation: unexpected error: %v", err)
+		}
+		if hit.Hit {
+			t.Fatalf("query %+v still hit after invalidation", query)
+		}
+	}
 }
 
 func TestInvalidateStartsNewGeneration(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a", "gen-b")
+	ctx := context.Background()
 
-	first, err := cache.Get(context.Background())
+	first, err := cache.Get(ctx, defaultQuery())
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
-	if err := cache.Invalidate(context.Background()); err != nil {
+	if err := cache.Invalidate(ctx); err != nil {
 		t.Fatalf("Invalidate() unexpected error: %v", err)
 	}
-	second, err := cache.Get(context.Background())
+	second, err := cache.Get(ctx, defaultQuery())
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
@@ -311,7 +479,7 @@ func TestInvalidationFailureDegradesReadsAndRecovers(t *testing.T) {
 	if err := cache.Invalidate(context.Background()); err == nil {
 		t.Fatal("Invalidate() failure: want error, got nil")
 	}
-	if _, err := cache.Get(context.Background()); !errors.Is(err, errDegraded) {
+	if _, err := cache.Get(context.Background(), defaultQuery()); !errors.Is(err, errDegraded) {
 		t.Fatalf("Get() error = %v, want errDegraded while invalidation is outstanding", err)
 	}
 
@@ -319,7 +487,7 @@ func TestInvalidationFailureDegradesReadsAndRecovers(t *testing.T) {
 	if err := cache.Invalidate(context.Background()); err != nil {
 		t.Fatalf("Invalidate() recovery: unexpected error: %v", err)
 	}
-	if _, err := cache.Get(context.Background()); err != nil {
+	if _, err := cache.Get(context.Background(), defaultQuery()); err != nil {
 		t.Fatalf("Get() after recovery: unexpected error: %v", err)
 	}
 }
@@ -341,7 +509,7 @@ func TestDegradedCacheRecoversAfterCooldown(t *testing.T) {
 
 	// Reads during the cooldown must not dial Redis on every request.
 	before := store.getCalls
-	if _, err := cache.Get(context.Background()); !errors.Is(err, errDegraded) {
+	if _, err := cache.Get(context.Background(), defaultQuery()); !errors.Is(err, errDegraded) {
 		t.Fatalf("Get() error = %v, want errDegraded during the cooldown", err)
 	}
 	if store.getCalls != before {
@@ -353,7 +521,7 @@ func TestDegradedCacheRecoversAfterCooldown(t *testing.T) {
 	store.setErr = nil
 	now = now.Add(recoveryInterval + time.Second)
 
-	snapshot, err := cache.Get(context.Background())
+	snapshot, err := cache.Get(context.Background(), defaultQuery())
 	if err != nil {
 		t.Fatalf("Get() after the cooldown: unexpected error: %v", err)
 	}
@@ -364,13 +532,13 @@ func TestDegradedCacheRecoversAfterCooldown(t *testing.T) {
 		t.Fatalf("token = %q, want the recovery generation", snapshot.Token)
 	}
 
-	if err := cache.Set(context.Background(), service.ListSnapshot{
-		Tasks: []domain.Task{{ID: "id-1", Title: "fresh", Status: domain.StatusTodo}},
-		Token: snapshot.Token,
+	if err := cache.Set(context.Background(), defaultQuery(), service.ListSnapshot{
+		Result: pageOf(domain.Task{ID: "id-1", Title: "fresh", Status: domain.StatusTodo}),
+		Token:  snapshot.Token,
 	}); err != nil {
 		t.Fatalf("Set() after recovery: unexpected error: %v", err)
 	}
-	hit, err := cache.Get(context.Background())
+	hit, err := cache.Get(context.Background(), defaultQuery())
 	if err != nil {
 		t.Fatalf("Get() after refill: unexpected error: %v", err)
 	}
@@ -393,7 +561,7 @@ func TestDegradedCacheRetriesAtMostOncePerInterval(t *testing.T) {
 	setAttempts := store.setCalls
 	now = now.Add(recoveryInterval + time.Second)
 	for i := 0; i < 3; i++ {
-		if _, err := cache.Get(context.Background()); err == nil {
+		if _, err := cache.Get(context.Background(), defaultQuery()); err == nil {
 			t.Fatalf("Get() %d: want an error while Redis is still down", i)
 		}
 	}
@@ -406,9 +574,11 @@ func TestDegradedCacheRetriesAtMostOncePerInterval(t *testing.T) {
 func TestStaleRefillAfterInvalidationIsNotReadable(t *testing.T) {
 	store := newFakeStore()
 	cache := newTestCache(store, time.Minute, "gen-a", "gen-b")
+	ctx := context.Background()
+	query := defaultQuery()
 
 	// A GET misses and reads the old generation.
-	stale, err := cache.Get(context.Background())
+	stale, err := cache.Get(ctx, query)
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
@@ -417,25 +587,25 @@ func TestStaleRefillAfterInvalidationIsNotReadable(t *testing.T) {
 	}
 
 	// A mutation commits and invalidates while that GET is still running.
-	if err := cache.Invalidate(context.Background()); err != nil {
+	if err := cache.Invalidate(ctx); err != nil {
 		t.Fatalf("Invalidate() unexpected error: %v", err)
 	}
 
 	// The slow GET publishes its old result under the old generation.
-	if err := cache.Set(context.Background(), service.ListSnapshot{
-		Tasks: []domain.Task{{ID: "stale", Title: "stale", Status: domain.StatusTodo}},
-		Token: stale.Token,
+	if err := cache.Set(ctx, query, service.ListSnapshot{
+		Result: pageOf(domain.Task{ID: "stale", Title: "stale", Status: domain.StatusTodo}),
+		Token:  stale.Token,
 	}); err != nil {
 		t.Fatalf("Set() unexpected error: %v", err)
 	}
 
 	// New readers use the new generation and must not see the stale write.
-	got, err := cache.Get(context.Background())
+	got, err := cache.Get(ctx, query)
 	if err != nil {
 		t.Fatalf("Get() unexpected error: %v", err)
 	}
 	if got.Hit {
-		t.Fatalf("Get() hit stale data after invalidation: %+v", got.Tasks)
+		t.Fatalf("Get() hit stale data after invalidation: %+v", got.Result.Tasks)
 	}
 }
 

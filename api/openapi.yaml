@@ -35,28 +35,76 @@ paths:
       tags:
         - Tasks
       operationId: listTasks
-      summary: List tasks
+      summary: List, filter, and paginate tasks
       description: |
-        Returns every task ordered by `id` ascending. An empty collection is
-        returned as `[]`, never `null`.
+        Returns one page of tasks ordered by `id` ascending. The identifier is
+        unique, so the ordering is deterministic and pages never overlap for a
+        fixed data set. Ordering is by identifier, not by creation time.
+
+        Filters are applied before pagination and before the total is counted,
+        and the page and its `total` come from the same filtered set. An empty
+        result is returned as `"items": []`, never `null`. A page beyond the
+        last one returns the correct `total` and an empty `items` array rather
+        than an error.
+
+        `page` defaults to 1 and must be at least 1. `page_size` defaults to 20
+        and must be between 1 and 100. Out-of-range values, unknown query
+        parameters, and unsupported status values are rejected with `400` and
+        the standard error envelope; nothing is silently clamped, ignored, or
+        defaulted over.
+
+        Equivalent requests share one cache entry: the assignee filter is
+        trimmed, and an omitted parameter is the same as its documented
+        default. Every successful task mutation invalidates all cached pages.
+      parameters:
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/AssigneeFilter'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
       responses:
         '200':
-          description: The task collection.
+          description: One page of matching tasks and its pagination metadata.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TaskList'
+                $ref: '#/components/schemas/TaskPage'
               examples:
                 empty:
                   summary: No tasks
-                  value: []
-                populated:
-                  summary: One task
                   value:
-                    - id: 6f1c2a4e-8d3b-4f5a-9c7e-1a2b3c4d5e6f
-                      title: Write the report
-                      description: Cover the API contract.
-                      status: todo
+                    items: []
+                    page: 1
+                    page_size: 20
+                    total: 0
+                    total_pages: 0
+                populated:
+                  summary: First page with defaults
+                  value:
+                    items:
+                      - id: 6f1c2a4e-8d3b-4f5a-9c7e-1a2b3c4d5e6f
+                        title: Write the report
+                        description: Cover the API contract.
+                        status: todo
+                        assignee: alice
+                    page: 1
+                    page_size: 20
+                    total: 1
+                    total_pages: 1
+                filtered:
+                  summary: Second page of alice's done tasks
+                  value:
+                    items:
+                      - id: 9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d
+                        title: Review the contract
+                        description: ''
+                        status: done
+                        assignee: alice
+                    page: 2
+                    page_size: 1
+                    total: 3
+                    total_pages: 3
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '500':
@@ -70,8 +118,9 @@ paths:
       description: |
         Creates a task and returns it with a server-assigned UUID. `title` is
         required and trimmed of leading and trailing whitespace before storage;
-        `description` defaults to an empty string, is stored as sent, and
-        `status` defaults to `todo`.
+        `description` defaults to an empty string, is stored as sent, `status`
+        defaults to `todo`, and `assignee` defaults to an empty label and is
+        trimmed.
 
         Creation is served at `/task`; the collection path `/tasks` is
         read-only. The created task is returned with a `Location` header
@@ -95,6 +144,7 @@ paths:
                   title: Write the report
                   description: Cover the API contract.
                   status: in_progress
+                  assignee: alice
       responses:
         '201':
           description: The task was created.
@@ -116,6 +166,7 @@ paths:
                     title: Write the report
                     description: Cover the API contract.
                     status: todo
+                    assignee: alice
         '400':
           $ref: '#/components/responses/BadRequest'
         '405':
@@ -146,6 +197,7 @@ paths:
                     title: Write the report
                     description: Cover the API contract.
                     status: todo
+                    assignee: alice
         '400':
           $ref: '#/components/responses/InvalidTaskId'
         '404':
@@ -161,9 +213,9 @@ paths:
       summary: Replace a task
       description: |
         Replaces the mutable fields of an existing task. This is a full
-        replacement: omitted `description` and `status` values take their
-        defaults (`""` and `todo`), and the `id` cannot be supplied or changed.
-        The response is the stored task.
+        replacement: omitted `description`, `status`, and `assignee` values take
+        their defaults (`""`, `todo`, `""`), and the `id` cannot be supplied or
+        changed. The response is the stored task.
       requestBody:
         required: true
         description: The complete replacement values.
@@ -178,6 +230,7 @@ paths:
                   title: Write the final report
                   description: Include the OpenAPI contract.
                   status: done
+                  assignee: bob
       responses:
         '200':
           description: The task was replaced.
@@ -193,6 +246,7 @@ paths:
                     title: Write the final report
                     description: Include the OpenAPI contract.
                     status: done
+                    assignee: bob
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -294,11 +348,59 @@ components:
         format: uuid
         pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
         example: 6f1c2a4e-8d3b-4f5a-9c7e-1a2b3c4d5e6f
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      description: |
+        Return only tasks in this status. Omitted means any status. The value is
+        matched exactly and must be one of the documented statuses; anything
+        else is a `400`, not an empty result.
+      schema:
+        $ref: '#/components/schemas/TaskStatus'
+    AssigneeFilter:
+      name: assignee
+      in: query
+      required: false
+      description: |
+        Return only tasks assigned to exactly this label (case-sensitive).
+        Leading and trailing whitespace is trimmed, and the value must be 1-100
+        characters. Omitted means any assignee; this version cannot filter for
+        unassigned tasks alone.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 100
+        example: alice
+    Page:
+      name: page
+      in: query
+      required: false
+      description: |
+        One-based page number. Defaults to 1. A page beyond the last one is a
+        valid request and returns an empty `items` array with the correct
+        totals.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+        example: 2
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      description: Maximum number of tasks in one page. Defaults to 20; the largest accepted value is 100.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+        example: 20
   responses:
     BadRequest:
       description: |
-        The request body is malformed or fails validation, or a path identifier
-        is not a UUID.
+        The request body is malformed or fails validation, a path identifier is
+        not a UUID, or a query parameter is unsupported or out of range.
       content:
         application/json:
           schema:
@@ -319,6 +421,14 @@ components:
                   fields:
                     title: title is required
                     status: 'status must be one of: todo, in_progress, done'
+            queryValidation:
+              summary: Invalid query parameters
+              value:
+                error:
+                  code: validation_error
+                  message: invalid query parameters
+                  fields:
+                    page_size: must be at most 100
     InvalidTaskId:
       description: The path identifier is not a UUID.
       content:
@@ -382,6 +492,7 @@ components:
         - title
         - description
         - status
+        - assignee
       additionalProperties: false
       properties:
         id:
@@ -400,12 +511,18 @@ components:
           example: Cover the API contract.
         status:
           $ref: '#/components/schemas/TaskStatus'
+        assignee:
+          type: string
+          description: |
+            Who owns the task, as a free-form label. Empty when unassigned.
+            Trimmed of leading and trailing whitespace; at most 100 characters.
+          example: alice
     TaskWrite:
       type: object
       description: |
         Writable task fields. The body must contain exactly one JSON object;
-        unknown fields are rejected. `title` is required; `description` and
-        `status` default to `""` and `todo`.
+        unknown fields are rejected. `title` is required; `description`,
+        `status`, and `assignee` default to `""`, `todo`, and `""`.
       required:
         - title
       additionalProperties: false
@@ -425,6 +542,14 @@ components:
             - $ref: '#/components/schemas/TaskStatus'
           default: todo
           description: Workflow status.
+        assignee:
+          type: string
+          maxLength: 100
+          default: ''
+          description: |
+            Optional owner label, trimmed before storage. Omitting it (or
+            sending an empty string) stores the task as unassigned.
+          example: alice
     TaskStatus:
       type: string
       description: A task's workflow state.
@@ -432,11 +557,50 @@ components:
         - todo
         - in_progress
         - done
-    TaskList:
-      type: array
-      description: Tasks ordered by `id` ascending.
-      items:
-        $ref: '#/components/schemas/Task'
+    TaskPage:
+      type: object
+      description: One page of tasks with its pagination metadata.
+      required:
+        - items
+        - page
+        - page_size
+        - total
+        - total_pages
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          description: |
+            Tasks in this page, ordered by `id` ascending. `[]` when the page is
+            empty or beyond the last page; never `null`.
+          items:
+            $ref: '#/components/schemas/Task'
+        page:
+          type: integer
+          minimum: 1
+          description: Echoes the requested page number.
+          example: 1
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: Echoes the effective page size.
+          example: 20
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Number of tasks matching the filters before pagination. It is the
+            same for every page of one filtered result.
+          example: 42
+        total_pages:
+          type: integer
+          minimum: 0
+          description: |
+            Number of pages the filtered result occupies
+            (`ceil(total / page_size)`). Zero when nothing matches.
+          example: 3
     ErrorResponse:
       type: object
       description: The error envelope for task failures and route-level 404/405 responses.

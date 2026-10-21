@@ -35,6 +35,7 @@ structured request log. A multi-stage Docker image and a
 | Task service use cases behind a repository interface | Implemented |
 | PostgreSQL task repository using explicit SQL | Implemented |
 | Redis cache-aside for `GET /tasks` with generation-token invalidation | Implemented |
+| Filtering by `status` and `assignee`, plus deterministic pagination | Implemented |
 | CRUD endpoints: `POST /task` and `GET/PUT/DELETE /tasks` | Implemented |
 | Uniform JSON error envelope and `404` / `405` handling | Implemented |
 | OpenAPI 3.0.3 contract and embedded Swagger UI | Implemented |
@@ -42,7 +43,7 @@ structured request log. A multi-stage Docker image and a
 | GitHub Actions CI with PostgreSQL, Redis, coverage gate, and image build | Implemented |
 | Multi-stage Docker image and Docker Compose environment | Implemented |
 | Authentication, authorization, and multi-tenancy | Not implemented |
-| Filtering, pagination, sorting controls, and search | Not implemented |
+| Sorting controls and free-text search | Not implemented (ordering is fixed to `id`; filters are exact matches) |
 | Task timestamps, priorities, tags, or soft delete | Not implemented |
 | Metrics storage, dashboards, and alerting | Not implemented (the service exposes `/metrics`; no Prometheus server or Grafana is bundled) |
 | Distributed tracing (OpenTelemetry, spans, exporters) | Not implemented (requests are correlated within this process, not traced across services) |
@@ -70,18 +71,24 @@ the service runs database-only, and a Redis outage falls back to PostgreSQL.
 
 ### Scope and limitations
 
-This is a single-aggregate REST service. The task resource has four fields,
-`id`, `title`, `description`, and `status`, and there are no timestamps or
-ownership fields. The API is unauthenticated and has no pagination, filtering,
-sorting, search, or transition rules for status values.
+This is a single-aggregate REST service. The task resource has five fields,
+`id`, `title`, `description`, `status`, and `assignee`, and there are no
+timestamps or ownership enforcement: `assignee` is a free-form label, not an
+account reference. The API is unauthenticated and has no sorting controls,
+free-text search, or transition rules for status values. Filtering is limited
+to exact `status` and `assignee` matches, and tasks cannot be filtered for
+being unassigned.
 
 The service is intended to run against PostgreSQL. It has no volatile storage
 mode, no automatic database provisioning, and no migration-at-startup behavior.
-Redis caches only the `GET /tasks` list; task writes always commit to
-PostgreSQL first. Cache entries expire after a finite TTL, and a mutation
-advances a generation token so a slow reader cannot republish a pre-mutation
-list. The consistency limits are documented in
-[ADR 0013](decisions/0013-redis-cache-aside-for-task-list.md).
+Redis caches only `GET /tasks`, one entry per filter/page combination; task
+writes always commit to PostgreSQL first. Cache entries expire after a finite
+TTL, and a mutation advances a generation token so every variant is
+invalidated at once and a slow reader cannot republish a pre-mutation page.
+The consistency limits are documented in
+[ADR 0013](decisions/0013-redis-cache-aside-for-task-list.md) and the
+filtering/cache-key rules in
+[ADR 0014](decisions/0014-task-filtering-and-pagination.md).
 Production concerns such as authentication, authorization, rate limiting,
 metrics storage and dashboards, distributed tracing, and horizontal
 coordination are outside the current scope. The metrics endpoint is
@@ -146,10 +153,11 @@ curl -s http://localhost:8080/health
 # {"database":"ok","status":"ok"}
 
 curl -s http://localhost:8080/tasks
-# [] on a fresh database; this GET creates the cache entry
+# {"items":[],"page":1,"page_size":20,"total":0,"total_pages":0}
+# on a fresh database; this GET creates one cache entry for that query
 
 docker compose exec redis redis-cli --scan --pattern 'task-manager:tasks:list:*'
-# task-manager:tasks:list:generation and one task-manager:tasks:list:<token>
+# task-manager:tasks:list:generation and one task-manager:tasks:list:<token>:<query> per variant
 
 curl -s http://localhost:8080/metrics | head
 # Prometheus text exposition: requests_total, request_latency_histogram, ...
@@ -279,7 +287,7 @@ loaded in the composition root described by
 | `DATABASE_MAX_IDLE_CONNS` | No | `5` | Maximum idle connections retained. |
 | `DATABASE_CONN_MAX_LIFETIME` | No | `30m` | Maximum lifetime of a pooled connection. |
 | `REDIS_URL` | No | *(empty)* | go-redis connection URL, for example `redis://localhost:6379/0`. Empty disables the task-list cache. An invalid URL disables caching but does not stop startup. |
-| `REDIS_CACHE_TTL` | No | `60s` | Lifetime of a cached `GET /tasks` list. Must be positive; zero, negative, and unparsable values fall back to `60s`. |
+| `REDIS_CACHE_TTL` | No | `60s` | Lifetime of a cached `GET /tasks` page. Every query variant uses it. Must be positive; zero, negative, and unparsable values fall back to `60s`. |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warn`, or `error`; any other value falls back to `info`. |
 | `METRICS_TASKS_REFRESH_INTERVAL` | No | `15s` | How often `tasks_count` is re-read from PostgreSQL. Zero, negative, and unparsable values fall back to `15s`. |
 | `TEST_DATABASE_URL` | No | *(empty)* | Test-only DSN for PostgreSQL integration tests; the service ignores it. |
@@ -403,7 +411,7 @@ Base URL for the examples: `http://localhost:8080`.
 | Method | Path | Purpose | Success | Request body |
 | --- | --- | --- | --- | --- |
 | `POST` | `/task` | Create a task | `201` with the task and a `Location: /tasks/{id}` header | Required |
-| `GET` | `/tasks` | List every task ordered by `id` ascending | `200` with a JSON array, `[]` when empty | None |
+| `GET` | `/tasks` | List, filter, and paginate tasks ordered by `id` ascending | `200` with a page envelope, `items: []` when empty | None |
 | `GET` | `/tasks/{id}` | Retrieve one task | `200` with the task | None |
 | `PUT` | `/tasks/{id}` | Replace the mutable fields of a task | `200` with the replaced task | Required |
 | `DELETE` | `/tasks/{id}` | Delete a task | `204` with no body | None |
@@ -415,7 +423,8 @@ Task representation:
   "id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
   "title": "Write the report",
   "description": "Cover the API contract",
-  "status": "todo"
+  "status": "todo",
+  "assignee": "alice"
 }
 ```
 
@@ -427,27 +436,28 @@ Fields and rules:
 | `title` | string | Required. Leading and trailing whitespace is trimmed. Empty or whitespace-only titles are rejected. |
 | `description` | string | Optional; defaults to `""`. Stored as sent, without trimming. |
 | `status` | string | One of `todo`, `in_progress`, `done`. Defaults to `todo` when omitted. |
+| `assignee` | string | Optional free-form label, at most 100 characters. Trimmed; empty means unassigned and is returned as `""`. Not an account reference and not authenticated. |
 
 Additional behavior:
 
 - Request bodies are decoded strictly. Unknown fields, trailing content, wrong
   types, empty bodies, and JSON arrays return `400 invalid_request`.
-- `PUT` is a full replacement. `title` is required, omitted `description`
-  becomes `""`, and omitted `status` resets to `todo`. A missing task is never
-  created by `PUT`.
+- `PUT` is a full replacement. `title` is required, omitted `description`,
+  `status`, and `assignee` reset to `""`, `todo`, and `""`. A missing task is
+  never created by `PUT`.
 - A malformed `{id}` returns `400 validation_error`; a well-formed UUID that is
   not stored returns `404 not_found`.
-- `GET /tasks` returns every row ordered by `id` ascending. The order is stable
-  across calls but is not creation order.
-- No authentication, authorization, filtering, pagination, or sorting controls
-  are implemented.
+- `GET /tasks` returns one page ordered by `id` ascending. The identifier is
+  unique, so the order is stable across calls and pages never overlap; it is
+  not creation order.
+- No authentication, authorization, or sorting controls are implemented.
 
 #### Create a task
 
 ```bash
 curl -i -X POST http://localhost:8080/task \
   -H 'Content-Type: application/json' \
-  -d '{"title":"Write the report","description":"Cover the API contract","status":"in_progress"}'
+  -d '{"title":"Write the report","description":"Cover the API contract","status":"in_progress","assignee":"alice"}'
 ```
 
 ```http
@@ -461,26 +471,85 @@ Content-Type: application/json; charset=utf-8
   "id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
   "title": "Write the report",
   "description": "Cover the API contract",
-  "status": "in_progress"
+  "status": "in_progress",
+  "assignee": "alice"
 }
 ```
 
-#### List, get, replace, and delete
+#### List, filter, and paginate
+
+`GET /tasks` returns a page envelope rather than a bare array:
+
+```json
+{
+  "items": [
+    {
+      "id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+      "title": "Write the report",
+      "description": "Cover the API contract",
+      "status": "done",
+      "assignee": "alice"
+    }
+  ],
+  "page": 2,
+  "page_size": 1,
+  "total": 3,
+  "total_pages": 3
+}
+```
+
+| Query parameter | Type | Default | Rules |
+| --- | --- | --- | --- |
+| `status` | string | *(any)* | Exactly one of `todo`, `in_progress`, `done`. Case-sensitive; any other value is a `400`. |
+| `assignee` | string | *(any)* | Exact, case-sensitive label match. Trimmed; 1–100 characters when present. Omitted returns assigned and unassigned tasks. |
+| `page` | integer | `1` | One-based. Zero, negatives, non-integers, and offsets that would overflow are rejected with `400`. |
+| `page_size` | integer | `20` | 1–100. Values above 100 are rejected, not clamped. |
+
+Metadata semantics:
+
+- `items` holds the page's tasks, ordered by `id` ascending. It is always an
+  array, `[]` for an empty or beyond-the-last page.
+- `total` counts every task matching the filters, before pagination. It is the
+  same for every page of one filtered result.
+- `total_pages` is `ceil(total / page_size)`, and `0` when nothing matches.
+- `page` and `page_size` echo the effective values, including defaults.
+- A page beyond the last is valid: it returns `items: []` and the correct
+  `total`/`total_pages`.
+- Unknown query parameters are rejected with `400`, so a typo cannot silently
+  return an unfiltered page.
 
 ```bash
+# First page, defaults
 curl -i http://localhost:8080/tasks
+
+# Alice's completed tasks, two per page, second page
+curl -i 'http://localhost:8080/tasks?status=done&assignee=alice&page=2&page_size=2'
 
 curl -i http://localhost:8080/tasks/6ba7b810-9dad-41d1-80b4-00c04fd430c8
 
 curl -i -X PUT http://localhost:8080/tasks/6ba7b810-9dad-41d1-80b4-00c04fd430c8 \
   -H 'Content-Type: application/json' \
-  -d '{"title":"Report published","description":"Done","status":"done"}'
+  -d '{"title":"Report published","description":"Done","status":"done","assignee":"bob"}'
 
 curl -i -X DELETE http://localhost:8080/tasks/6ba7b810-9dad-41d1-80b4-00c04fd430c8
 ```
 
 `DELETE` returns `204 No Content`. A later `GET` for the same ID returns `404`,
 and the row is removed from PostgreSQL.
+
+An invalid query string uses the same envelope:
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "invalid query parameters",
+    "fields": {
+      "page_size": "must be at most 100"
+    }
+  }
+}
+```
 
 ### Error responses
 
@@ -682,7 +751,8 @@ repository knows how to count persisted tasks.
 `internal/task/cache/redis` is the cache-aside driven adapter. It implements
 the `service.ListCache` port, owns the Redis key layout and generation token,
 and handles Redis failures; the service and domain packages never import
-Redis. The cache stores only the unfiltered `GET /tasks` list. PostgreSQL
+Redis. The cache stores `GET /tasks` pages, one entry per normalized query
+(status, assignee, page, page size) under the current generation. PostgreSQL
 remains authoritative, and a cache read, write, or invalidation failure falls
 back to the database.
 
@@ -701,10 +771,10 @@ back to the database.
 | `internal/infra/swagger` | Docs adapter: serves the embedded spec and Swagger UI under `/swagger`; registers only `GET`. |
 | `api` | Embeds `api/openapi.yaml` as `api.OpenAPI`; no business or transport logic. |
 | `internal/task/domain` | `Task`, the closed `Status` set, validation, and UUID identifier format and generation. |
-| `internal/task/service` | Create, list, get, update, and delete use cases; declares the `Repository` and `ListCache` interfaces it consumes and invalidates the list after committed mutations. |
-| `internal/task/cache/redis` | Cache-aside adapter for the task list: generation-token invalidation, finite TTL, JSON payload, malformed-data handling, and fail-open cache failures. |
-| `internal/task/handler` | Strict request decoding, path-ID validation, response mapping, and error mapping; declares the `TaskService` interface it consumes. |
-| `internal/task/repository/postgres` | Explicit SQL CRUD, identifier generation, `sql.ErrNoRows` to `service.ErrNotFound`, deterministic list order, and the `tasks` row count used by metrics. |
+| `internal/task/service` | Create, list (filtered and paginated), get, update, and delete use cases; normalizes list queries with defaults and bounds, declares the `Repository` and `ListCache` interfaces it consumes, and invalidates every cached page after a committed mutation. |
+| `internal/task/cache/redis` | Cache-aside adapter for task-list pages: one entry per normalized query under the generation token, finite TTL, versioned JSON payload with pagination metadata, malformed-data handling, and fail-open cache failures. |
+| `internal/task/handler` | Strict request and query decoding, query/path validation, the paginated envelope, response and error mapping; declares the `TaskService` interface it consumes. |
+| `internal/task/repository/postgres` | Explicit SQL CRUD, identifier generation, `sql.ErrNoRows` to `service.ErrNotFound`, parameterized filtering with a matching count, deterministic `id` order, and the `tasks` row count used by metrics. |
 
 ### Wiring and startup
 
@@ -716,8 +786,8 @@ then `Start`. The composition root performs the actual wiring:
 3. `DATABASE_URL` is required. An empty value aborts startup.
 4. `database.New` validates the DSN and opens the pool without dialing.
 5. `Initialize` pings with a five-second budget and calls
-   `database.VerifySchema`, which requires the `tasks` table. A failure closes
-   the pool and stops startup.
+   `database.VerifySchema`, which requires the `tasks` table and the columns the
+   binary reads (`assignee`). A failure closes the pool and stops startup.
 6. The task repository is constructed once and shared by the metrics refresher
    and the task module.
 7. If `REDIS_URL` is set, the Redis cache adapter is constructed. It does not
@@ -790,7 +860,7 @@ internal/task/
 11. Cache invalidation is part of a mutation's contract: after a committed
     task-list mutation, invalidate through the service. Do not delete keys in a
     handler or bypass the use case. A new list-shaped read needs its own key
-    and invalidation decision; never reuse the unfiltered list key.
+    and invalidation decision; never reuse another query's variant key.
 
 ## 7. Database and Migrations
 
@@ -806,16 +876,22 @@ CREATE TABLE IF NOT EXISTS tasks (
     id          UUID PRIMARY KEY,
     title       TEXT NOT NULL CHECK (btrim(title) <> ''),
     description TEXT NOT NULL DEFAULT '',
-    status      TEXT NOT NULL CHECK (status IN ('todo', 'in_progress', 'done'))
+    status      TEXT NOT NULL CHECK (status IN ('todo', 'in_progress', 'done')),
+    assignee    TEXT CHECK (assignee IS NULL
+                            OR (btrim(assignee) <> '' AND char_length(assignee) <= 100))
 );
 
 CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks (status);
+CREATE INDEX IF NOT EXISTS tasks_assignee_idx ON tasks (assignee);
 ```
 
 The table contains exactly the API fields. The `CHECK` constraints duplicate
 the domain rules so a manual statement or a future write path cannot store a
-blank title or an unknown status. `GET /tasks` uses `id` ascending for its
-stable order, not creation order.
+blank title, an unknown status, or a blank/over-long assignee. `assignee` is
+NULL when unassigned, which is the single stored representation; the API
+always renders it as `""`. `GET /tasks` uses `id` ascending for its stable
+order, not creation order, and filters on the two indexed columns before
+applying `LIMIT`/`OFFSET`.
 
 ### Migrations
 
@@ -831,6 +907,14 @@ The current migrations are:
 | --- | --- |
 | `0001_create_tasks.sql` | Creates the `tasks` table and its constraints. |
 | `0002_index_tasks_status.sql` | Creates `tasks_status_idx` on `status`. |
+| `0003_add_task_assignee.sql` | Adds the nullable `assignee` column and its check constraint. |
+| `0004_index_tasks_assignee.sql` | Creates `tasks_assignee_idx` on `assignee`. |
+
+`0003` and `0004` must be applied before running a binary that filters by
+assignee: startup verifies that the column exists and fails with
+`schema is out of date: column "assignee" on table "tasks" is missing`
+otherwise. Applying them is additive and backward compatible: an older binary
+ignores the column, and existing rows read as unassigned (`""`).
 
 Apply them explicitly:
 
@@ -856,9 +940,10 @@ docker compose logs migrate
 ### Startup and persistence
 
 `sql.Open` is lazy, so startup explicitly pings with a five-second budget and
-then verifies the table with `database.VerifySchema`. A reachable server with a
-missing table is not considered ready. There is no in-memory fallback and no
-automatic database provisioning.
+then verifies the required table and columns with `database.VerifySchema`. A
+reachable server with a missing table or a missing `assignee` column is not
+considered ready. There is no in-memory fallback and no automatic database
+provisioning.
 
 Tasks are durable and shared by every process pointed at the same database.
 They survive process restarts, container restarts, image rebuilds, and
@@ -959,7 +1044,7 @@ Important details:
   not rewrite files or fail. Use `gofmt -w .` to fix them. CI fails when any file
   is listed.
 - `coverage.out` matches `*.out` in `.gitignore`.
-- Measured statement coverage on this tree is **80.1%** with PostgreSQL and
+- Measured statement coverage on this tree is **80.8%** with PostgreSQL and
   Redis, and lower without them. The PostgreSQL and Redis adapters only execute
   in their integration tiers.
 - `make coverage-check` enforces `COVERAGE_MIN` (default `70`) on the combined
@@ -982,14 +1067,28 @@ Important details:
   row inserted outside the repository, so the gauge's source of truth is
   exercised rather than mocked.
 - `internal/task/service` tests prove cache hits skip the repository, empty
-  lists are hits, misses populate the cache, read/write failures fall back, and
+  pages are hits, misses populate the cache, read/write failures fall back, and
   only successful create/update/delete operations invalidate. They also prove
-  invalidation survives a canceled request context.
+  invalidation survives a canceled request context, that filters are applied
+  before pagination, that offsets and totals are computed correctly, and that
+  the cache receives the normalized query.
+- `internal/task/handler` tests cover every query-parameter failure (unknown
+  status, empty or oversized assignee, zero/negative/malformed/overflowing
+  page, page size above the maximum, unknown parameters), both filters alone
+  and combined, deterministic non-overlapping pages, beyond-the-last pages,
+  default and custom page sizes, and the exact envelope metadata.
 - `internal/task/cache/redis` unit tests cover generation initialization, key
   layout and TTL, empty and malformed payloads, degraded reads after a failed
   invalidation, the rate-limited recovery probe (success and continued
-  failure), and the stale-refill ordering. Integration tests repeat the command-level behavior
-  against a real Redis server, including expiration and concurrent first reads.
+  failure), and the stale-refill ordering. They also prove that every distinct
+  query produces a distinct variant key, that equivalent queries share one key,
+  and that two variants cannot answer each other. Integration tests repeat the
+  command-level behavior against a real Redis server, including expiration,
+  variant isolation, whole-family invalidation, and concurrent first reads.
+- The PostgreSQL suite covers filtering by status and assignee (alone and
+  combined), total counts that use the same filter as the page, deterministic
+  non-overlapping pages, beyond-the-last pages, SQL parameter binding for filter
+  values, and the assignee column constraints.
 - `internal/app` tests cover a missing `DATABASE_URL`, a malformed DSN, an
   unreachable server, a missing schema, and successful PostgreSQL wiring with
   caching disabled when `REDIS_URL` is empty.
@@ -1112,7 +1211,11 @@ docker build -t task-manager:local .
 | `tasks_count` refreshed on an interval instead of per request | No table scan on the request path; the value reflects PostgreSQL rather than process memory | Eventually consistent up to one interval; stale but timestamped when PostgreSQL is unavailable, and absent before the first success |
 | Request correlation via `X-Request-ID` instead of OpenTelemetry | Cheap, dependency-free log correlation; every response carries the ID | It is not distributed tracing: no spans, sampling, propagation into PostgreSQL, or trace backend |
 | 70% coverage gate on the combined suite | The gate measures the PostgreSQL and Redis adapters as well as unit tests | It requires live test services and a longer CI job |
-| Small, single-aggregate service | Easy to understand, test, and deploy | No authentication, pagination, filtering, sorting, search, timestamps, or multi-tenancy |
+| Paginated collection envelope instead of a bare array | One response carries items and trustworthy totals; a page beyond the end is unambiguous | Breaking change for clients that decoded `GET /tasks` as an array; they must read `items` |
+| Exact-match filters with a fixed `id` ordering, no sort parameter | Bounded query shapes, simple parameterized SQL, and an indexable plan | Clients cannot sort or search; ordering is by UUID, not creation time |
+| One cached entry per normalized query under a shared generation | Filtered and paginated reads are cached without collisions, and one mutation invalidates them all | Each distinct filter/page combination occupies its own key until the TTL expires |
+| `count(*)` per cache miss alongside the page query | `total` and `total_pages` are exact for the filtered set | Two queries per miss; the count scans the filtered rows |
+| Small, single-aggregate service | Easy to understand, test, and deploy | No authentication, sorting, search, timestamps, or multi-tenancy |
 
 Intentional scope limits are listed in [Overview](#1-overview). They are not
 claims that those features are partially implemented.
@@ -1146,6 +1249,7 @@ A few operational constraints are worth repeating:
 | `ping: ... connection refused` or `database unreachable` | PostgreSQL is not running, the host/port is wrong, or Compose is using the wrong host | Run `pg_isready`, check `docker compose logs postgres`, and remember that the Compose host is `postgres`, not `localhost` |
 | `role "..." does not exist` or authentication failure | The DSN role/database does not exist or the password is wrong | Create the role/database or correct `DATABASE_URL`; do not commit credentials |
 | `schema is not initialized: table "tasks" is missing` | Migrations were never applied, or were applied to another database | Run `make migrate` locally or `docker compose run --rm migrate` |
+| `schema is out of date: column "assignee" ... is missing` | The binary expects migration `0003`, but the database has only older versions | Run `make migrate` (or `docker compose run --rm migrate`) before starting the new binary |
 | Integration tests skip with `TEST_DATABASE_URL is not set` | The PostgreSQL integration tier was not enabled | Export `TEST_DATABASE_URL`; use `make test-integration` to fail instead of skipping |
 | Integration tests skip with `TEST_REDIS_URL is not set` | The Redis integration tier was not enabled | Start Redis (`docker compose up -d redis`) and export `TEST_REDIS_URL` |
 | `make coverage-check` refuses to run | `TEST_DATABASE_URL` or `TEST_REDIS_URL` is unset | Provide both test URLs; the gate intentionally requires both adapter tiers |
@@ -1160,6 +1264,9 @@ A few operational constraints are worth repeating:
 | `redis cache disabled` or `redis cache unavailable at startup` in the log | `REDIS_URL` is malformed or Redis is unreachable | The API still serves from PostgreSQL. Correct the URL or start Redis; a restart re-attempts the generation reset |
 | `task list cache failure` warnings on every GET | Redis is down, or invalidation failed earlier and the adapter is degraded | Check Redis health. The process bypasses the cache and serves PostgreSQL. A recovery probe retries every five seconds and a successful mutation invalidates immediately, so caching resumes once Redis answers |
 | `GET /tasks` keeps returning an old list after a write | The mutation failed (so it was not committed), or invalidation failed and was logged | Check the write response and the `task list cache invalidation failed` log. The cache is bypassed after that error; investigate Redis before restarting |
+| `GET /tasks` returns `400` with `invalid query parameters` | An unknown parameter (`staus`), an empty `assignee`, an unsupported `status`, `page` < 1 or non-numeric, or `page_size` outside 1–100 | Send only `status`, `assignee`, `page`, and `page_size` with the documented ranges; the `fields` object names the offending parameter |
+| `total` is larger than the number of `items` returned | Expected: `total` counts every task matching the filters, not just the requested page | Use `page`/`page_size` to walk the result, or `total_pages` to see how many pages exist |
+| Filtering returns nothing for a task that exists | The filter is an exact, case-sensitive match, and the task may be unassigned | Check the stored `assignee` on the task; `assignee` filters cannot select unassigned tasks |
 | Compose starts `app` but the log shows `redis cache unavailable at startup` | Redis was started but not ready, or is down; `app` waits only for the container to start | Expected. The API serves PostgreSQL and the adapter retries every five seconds, so caching resumes without a restart |
 | Every response has an unexpected `X-Request-ID` | A proxy supplied an invalid or oversized header, so the service replaced it | Expected; the response header always contains the final identifier, which also appears in the request log |
 | Redocly reports a missing `license` warning | The repository does not declare a license | This is advisory; validation still succeeds. Do not add a false license just to silence it |
@@ -1225,6 +1332,7 @@ as the practical guide for setup, operation, and the current API.
 | [0011. One composition point for HTTP module handlers](decisions/0011-http-handler-composition.md) | Compose HTTP modules through `buildHandlers` returning `server.RouteRegistrar` values; keep lifecycle in the composition root and avoid a plugin framework. | Accepted |
 | [0012. Consumer-owned ports remain the dependency-inversion boundary](decisions/0012-consumer-owned-ports-dependency-audit.md) | Audit the import graph against the dependency rule: ports stay with consumers, adapters and the composition root point inward, and no production code needed to change. | Accepted |
 | [0013. Redis cache-aside for task listing with generation-token invalidation](decisions/0013-redis-cache-aside-for-task-list.md) | Cache `GET /tasks` in Redis with a generation token; invalidate after committed creates, updates, and deletes, and fail open to PostgreSQL when Redis is unavailable. | Accepted |
+| [0014. Task filtering and pagination on a paginated collection envelope](decisions/0014-task-filtering-and-pagination.md) | Add `status`/`assignee` filters and `page`/`page_size` pagination over `id`-ordered SQL, returning `items` plus totals; cache one entry per normalized query under the existing generation. | Accepted |
 
 No record is superseded or deprecated. ADRs 0003, 0004, and 0007 carry amendment
 notes because later records refine part of their decision; read the amending ADR

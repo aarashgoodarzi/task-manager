@@ -7,6 +7,7 @@ package redis
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,8 +28,10 @@ const (
 	defaultKeyPrefix = "task-manager"
 
 	// cacheSchemaVersion versions the cached payload. A payload with another
-	// version is treated as a miss, not decoded speculatively.
-	cacheSchemaVersion = 1
+	// version is treated as a miss, not decoded speculatively. Version 2 added
+	// the pagination metadata, so version-1 entries are ignored rather than
+	// decoded with missing fields.
+	cacheSchemaVersion = 2
 
 	// generationReadAttempts bounds the initialize-on-first-read loop when
 	// several readers race to create the generation key.
@@ -159,11 +162,11 @@ func (c *Cache) Close() error {
 	return c.store.Close()
 }
 
-// Get returns a cached list and the generation it belongs to. A miss still
-// carries the observed generation so the following Set cannot write into a
-// newer generation. A degraded cache always reports an error, which makes the
-// service fall back to PostgreSQL.
-func (c *Cache) Get(ctx context.Context) (service.ListSnapshot, error) {
+// Get returns the cached page for one query and the generation it belongs to.
+// A miss still carries the observed generation so the following Set cannot
+// write into a newer generation. A degraded cache always reports an error,
+// which makes the service fall back to PostgreSQL.
+func (c *Cache) Get(ctx context.Context, query service.ListQuery) (service.ListSnapshot, error) {
 	if c.degraded.Load() && !c.tryRecover(ctx) {
 		return service.ListSnapshot{}, errDegraded
 	}
@@ -173,7 +176,7 @@ func (c *Cache) Get(ctx context.Context) (service.ListSnapshot, error) {
 		return service.ListSnapshot{}, err
 	}
 
-	raw, err := c.store.Get(ctx, c.listKey(token))
+	raw, err := c.store.Get(ctx, c.listKey(token, query))
 	if errors.Is(err, goredis.Nil) {
 		return service.ListSnapshot{Token: token}, nil
 	}
@@ -192,22 +195,28 @@ func (c *Cache) Get(ctx context.Context) (service.ListSnapshot, error) {
 
 	tasks := payload.Tasks
 	if tasks == nil {
-		// A cached empty list is valid and must remain an empty slice, not a
+		// A cached empty page is valid and must remain an empty slice, not a
 		// nil slice that a later encoder could render as null.
 		tasks = []domain.Task{}
 	}
 
 	return service.ListSnapshot{
-		Tasks: tasks,
+		Result: service.ListResult{
+			Tasks:      tasks,
+			Page:       payload.Page,
+			PageSize:   payload.PageSize,
+			Total:      payload.Total,
+			TotalPages: payload.TotalPages,
+		},
 		Token: token,
 		Hit:   true,
 	}, nil
 }
 
-// Set stores a list under the generation it was read from. If a mutation
-// replaced the generation after the read, this write is orphaned and expires
-// with its TTL instead of becoming the next reader's answer.
-func (c *Cache) Set(ctx context.Context, snapshot service.ListSnapshot) error {
+// Set stores one query's page under the generation it was read from. If a
+// mutation replaced the generation after the read, this write is orphaned and
+// expires with its TTL instead of becoming the next reader's answer.
+func (c *Cache) Set(ctx context.Context, query service.ListQuery, snapshot service.ListSnapshot) error {
 	if snapshot.Token == "" {
 		return fmt.Errorf("redis cache: store list: missing generation token")
 	}
@@ -216,14 +225,18 @@ func (c *Cache) Set(ctx context.Context, snapshot service.ListSnapshot) error {
 	}
 
 	payload, err := json.Marshal(cachedList{
-		Version: cacheSchemaVersion,
-		Tasks:   snapshot.Tasks,
+		Version:    cacheSchemaVersion,
+		Tasks:      snapshot.Result.Tasks,
+		Page:       snapshot.Result.Page,
+		PageSize:   snapshot.Result.PageSize,
+		Total:      snapshot.Result.Total,
+		TotalPages: snapshot.Result.TotalPages,
 	})
 	if err != nil {
 		return fmt.Errorf("redis cache: encode list: %w", err)
 	}
 
-	if err := c.store.Set(ctx, c.listKey(snapshot.Token), string(payload), c.ttl); err != nil {
+	if err := c.store.Set(ctx, c.listKey(snapshot.Token, query), string(payload), c.ttl); err != nil {
 		return fmt.Errorf("redis cache: store list: %w", err)
 	}
 	return nil
@@ -291,8 +304,22 @@ func (c *Cache) generationKey() string {
 	return c.prefix + ":tasks:list:generation"
 }
 
-func (c *Cache) listKey(token string) string {
-	return c.prefix + ":tasks:list:" + token
+// listKey names one query variant inside a generation. Every mutation replaces
+// the generation, so all variants become unreachable together and expire on
+// their own; there is no variant index to maintain or to get wrong.
+func (c *Cache) listKey(token string, query service.ListQuery) string {
+	return c.prefix + ":tasks:list:" + token + ":" + variantKey(query)
+}
+
+// variantKey identifies a normalized query. The service normalizes before
+// calling the adapter, so equivalent requests share one entry. The query is
+// hashed rather than concatenated so no assignee value can mimic another
+// field's delimiter, and the stored keys stay a fixed length.
+func variantKey(query service.ListQuery) string {
+	canonical := fmt.Sprintf("status=%s\x00assignee=%s\x00page=%d\x00page_size=%d",
+		query.Status, query.Assignee, query.Page, query.PageSize)
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:8])
 }
 
 // currentToken reads the generation, initializing it on first use. The
@@ -329,8 +356,12 @@ func (c *Cache) currentToken(ctx context.Context) (string, error) {
 // cachedList is the stored JSON envelope. The version makes a future payload
 // change a miss rather than an accidental decode of incompatible data.
 type cachedList struct {
-	Version int           `json:"version"`
-	Tasks   []domain.Task `json:"tasks"`
+	Version    int           `json:"version"`
+	Tasks      []domain.Task `json:"tasks"`
+	Page       int           `json:"page"`
+	PageSize   int           `json:"page_size"`
+	Total      int64         `json:"total"`
+	TotalPages int           `json:"total_pages"`
 }
 
 // newGenerationToken returns 128 random bits as lowercase hex. The value is a

@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/aarashgoodarzi/task-manager/internal/task/domain"
@@ -24,6 +27,8 @@ type fakeRepo struct {
 	createCalls int
 	listCalls   int
 	updateCalls int
+
+	lastFilter Filter
 }
 
 func newFakeRepo() *fakeRepo {
@@ -47,16 +52,35 @@ func (f *fakeRepo) Create(_ context.Context, task domain.Task) (domain.Task, err
 	return task, nil
 }
 
-func (f *fakeRepo) List(_ context.Context) ([]domain.Task, error) {
+func (f *fakeRepo) ListPage(_ context.Context, filter Filter) (TaskPage, error) {
 	f.listCalls++
+	f.lastFilter = filter
 	if f.listErr != nil {
-		return nil, f.listErr
+		return TaskPage{}, f.listErr
 	}
-	tasks := make([]domain.Task, 0, len(f.tasks))
+
+	matched := make([]domain.Task, 0, len(f.tasks))
 	for _, task := range f.tasks {
-		tasks = append(tasks, task)
+		if filter.Status != "" && task.Status != filter.Status {
+			continue
+		}
+		if filter.Assignee != "" && task.Assignee != filter.Assignee {
+			continue
+		}
+		matched = append(matched, task)
 	}
-	return tasks, nil
+	sort.Slice(matched, func(i, j int) bool { return matched[i].ID < matched[j].ID })
+
+	total := int64(len(matched))
+	start := filter.Offset
+	if start > total {
+		start = total
+	}
+	end := start + int64(filter.Limit)
+	if end > total {
+		end = total
+	}
+	return TaskPage{Tasks: matched[int(start):int(end)], Total: total}, nil
 }
 
 func (f *fakeRepo) Get(_ context.Context, id string) (domain.Task, error) {
@@ -175,12 +199,15 @@ func TestCreatePropagatesRepositoryError(t *testing.T) {
 }
 
 func TestListEmpty(t *testing.T) {
-	tasks, err := newService(newFakeRepo()).List(context.Background())
+	result, err := newService(newFakeRepo()).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if len(tasks) != 0 {
-		t.Fatalf("len(tasks) = %d, want 0", len(tasks))
+	if len(result.Tasks) != 0 {
+		t.Fatalf("len(tasks) = %d, want 0", len(result.Tasks))
+	}
+	if result.Page != 1 || result.PageSize != DefaultPageSize || result.Total != 0 || result.TotalPages != 0 {
+		t.Fatalf("result = %+v, want the documented empty defaults", result)
 	}
 }
 
@@ -189,12 +216,15 @@ func TestListPopulated(t *testing.T) {
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "first", Status: domain.StatusTodo}
 	repo.tasks["id-2"] = domain.Task{ID: "id-2", Title: "second", Status: domain.StatusDone}
 
-	tasks, err := newService(repo).List(context.Background())
+	result, err := newService(repo).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if len(tasks) != 2 {
-		t.Fatalf("len(tasks) = %d, want 2", len(tasks))
+	if len(result.Tasks) != 2 {
+		t.Fatalf("len(tasks) = %d, want 2", len(result.Tasks))
+	}
+	if result.Total != 2 || result.TotalPages != 1 {
+		t.Fatalf("result = %+v, want total 2 over one page", result)
 	}
 }
 
@@ -202,7 +232,7 @@ func TestListPropagatesRepositoryError(t *testing.T) {
 	repo := newFakeRepo()
 	repo.listErr = errors.New("storage exploded")
 
-	_, err := newService(repo).List(context.Background())
+	_, err := newService(repo).List(context.Background(), ListQuery{})
 	if !errors.Is(err, repo.listErr) {
 		t.Fatalf("List() error = %v, want wrapped repository error", err)
 	}
@@ -349,19 +379,23 @@ type fakeCache struct {
 	invalidateCalls int
 
 	lastSnapshot     ListSnapshot
+	lastGetQuery     ListQuery
+	lastSetQuery     ListQuery
 	invalidateCtxErr error
 }
 
-func (f *fakeCache) Get(context.Context) (ListSnapshot, error) {
+func (f *fakeCache) Get(_ context.Context, query ListQuery) (ListSnapshot, error) {
 	f.getCalls++
+	f.lastGetQuery = query
 	if f.getErr != nil {
 		return ListSnapshot{}, f.getErr
 	}
 	return f.snapshot, nil
 }
 
-func (f *fakeCache) Set(_ context.Context, snapshot ListSnapshot) error {
+func (f *fakeCache) Set(_ context.Context, query ListQuery, snapshot ListSnapshot) error {
 	f.setCalls++
+	f.lastSetQuery = query
 	f.lastSnapshot = snapshot
 	return f.setErr
 }
@@ -377,14 +411,14 @@ func TestListCacheHitReturnsCachedTasksWithoutRepository(t *testing.T) {
 	repo.tasks["db-task"] = domain.Task{ID: "db-task", Title: "from database", Status: domain.StatusTodo}
 
 	cached := []domain.Task{{ID: "cached-task", Title: "from cache", Status: domain.StatusDone}}
-	cache := &fakeCache{snapshot: ListSnapshot{Tasks: cached, Token: "gen-1", Hit: true}}
+	cache := &fakeCache{snapshot: ListSnapshot{Result: ListResult{Tasks: cached}, Token: "gen-1", Hit: true}}
 
-	tasks, err := New(repo, cache, nil).List(context.Background())
+	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if len(tasks) != 1 || tasks[0].ID != "cached-task" {
-		t.Fatalf("tasks = %+v, want the cached list", tasks)
+	if len(result.Tasks) != 1 || result.Tasks[0].ID != "cached-task" {
+		t.Fatalf("tasks = %+v, want the cached list", result.Tasks)
 	}
 	if repo.listCalls != 0 {
 		t.Fatalf("repository List called %d times, want 0 on a cache hit", repo.listCalls)
@@ -398,14 +432,14 @@ func TestListCacheHitEmptyListIsAValidHit(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["db-task"] = domain.Task{ID: "db-task", Title: "not empty", Status: domain.StatusTodo}
 
-	cache := &fakeCache{snapshot: ListSnapshot{Tasks: []domain.Task{}, Token: "gen-1", Hit: true}}
+	cache := &fakeCache{snapshot: ListSnapshot{Result: ListResult{Tasks: []domain.Task{}}, Token: "gen-1", Hit: true}}
 
-	tasks, err := New(repo, cache, nil).List(context.Background())
+	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if tasks == nil || len(tasks) != 0 {
-		t.Fatalf("tasks = %#v, want a non-nil empty list", tasks)
+	if result.Tasks == nil || len(result.Tasks) != 0 {
+		t.Fatalf("tasks = %#v, want a non-nil empty list", result.Tasks)
 	}
 	if repo.listCalls != 0 {
 		t.Fatalf("repository List called %d times, want 0 for an empty cached list", repo.listCalls)
@@ -419,12 +453,12 @@ func TestListCacheMissReadsRepositoryAndStoresResult(t *testing.T) {
 
 	cache := &fakeCache{snapshot: ListSnapshot{Token: "gen-1"}}
 
-	tasks, err := New(repo, cache, nil).List(context.Background())
+	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if len(tasks) != 2 {
-		t.Fatalf("len(tasks) = %d, want 2", len(tasks))
+	if len(result.Tasks) != 2 {
+		t.Fatalf("len(tasks) = %d, want 2", len(result.Tasks))
 	}
 	if repo.listCalls != 1 {
 		t.Fatalf("repository List called %d times, want 1", repo.listCalls)
@@ -435,8 +469,8 @@ func TestListCacheMissReadsRepositoryAndStoresResult(t *testing.T) {
 	if cache.lastSnapshot.Token != "gen-1" {
 		t.Fatalf("stored token = %q, want the token returned by Get", cache.lastSnapshot.Token)
 	}
-	if len(cache.lastSnapshot.Tasks) != 2 {
-		t.Fatalf("stored tasks = %+v, want the database list", cache.lastSnapshot.Tasks)
+	if len(cache.lastSnapshot.Result.Tasks) != 2 {
+		t.Fatalf("stored tasks = %+v, want the database list", cache.lastSnapshot.Result.Tasks)
 	}
 }
 
@@ -446,12 +480,12 @@ func TestListCacheReadFailureFallsBackToRepository(t *testing.T) {
 
 	cache := &fakeCache{getErr: errors.New("redis unavailable")}
 
-	tasks, err := New(repo, cache, nil).List(context.Background())
+	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if len(tasks) != 1 || tasks[0].ID != "id-1" {
-		t.Fatalf("tasks = %+v, want the database list", tasks)
+	if len(result.Tasks) != 1 || result.Tasks[0].ID != "id-1" {
+		t.Fatalf("tasks = %+v, want the database list", result.Tasks)
 	}
 	if repo.listCalls != 1 {
 		t.Fatalf("repository List called %d times, want the fallback query", repo.listCalls)
@@ -470,12 +504,12 @@ func TestListCacheWriteFailureStillReturnsDatabaseResult(t *testing.T) {
 		setErr:   errors.New("redis unavailable"),
 	}
 
-	tasks, err := New(repo, cache, nil).List(context.Background())
+	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if len(tasks) != 1 || tasks[0].ID != "id-1" {
-		t.Fatalf("tasks = %+v, want the database list", tasks)
+	if len(result.Tasks) != 1 || result.Tasks[0].ID != "id-1" {
+		t.Fatalf("tasks = %+v, want the database list", result.Tasks)
 	}
 	if cache.setCalls != 1 {
 		t.Fatalf("cache Set called %d times, want 1", cache.setCalls)
@@ -488,7 +522,7 @@ func TestListRepositoryFailureIsNotCached(t *testing.T) {
 
 	cache := &fakeCache{snapshot: ListSnapshot{Token: "gen-1"}}
 
-	_, err := New(repo, cache, nil).List(context.Background())
+	_, err := New(repo, cache, nil).List(context.Background(), ListQuery{})
 	if !errors.Is(err, repo.listErr) {
 		t.Fatalf("List() error = %v, want wrapped repository error", err)
 	}
@@ -503,12 +537,12 @@ func TestListMalformedCacheFallsBackToRepository(t *testing.T) {
 
 	cache := &fakeCache{getErr: errors.New("decode cached list: invalid character")}
 
-	tasks, err := New(repo, cache, nil).List(context.Background())
+	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if len(tasks) != 1 || tasks[0].ID != "id-1" {
-		t.Fatalf("tasks = %+v, want the database list", tasks)
+	if len(result.Tasks) != 1 || result.Tasks[0].ID != "id-1" {
+		t.Fatalf("tasks = %+v, want the database list", result.Tasks)
 	}
 	if repo.listCalls != 1 {
 		t.Fatalf("repository List called %d times, want the fallback query", repo.listCalls)
@@ -519,12 +553,12 @@ func TestCacheDisabledKeepsListWorking(t *testing.T) {
 	repo := newFakeRepo()
 	repo.tasks["id-1"] = domain.Task{ID: "id-1", Title: "stored", Status: domain.StatusTodo}
 
-	tasks, err := New(repo, nil, nil).List(context.Background())
+	result, err := New(repo, nil, nil).List(context.Background(), ListQuery{})
 	if err != nil {
 		t.Fatalf("List() unexpected error: %v", err)
 	}
-	if len(tasks) != 1 {
-		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	if len(result.Tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(result.Tasks))
 	}
 }
 
@@ -657,5 +691,196 @@ func TestInvalidationSurvivesCanceledRequestContext(t *testing.T) {
 	}
 	if cache.invalidateCtxErr != nil {
 		t.Fatalf("invalidation context error = %v, want a context detached from request cancellation", cache.invalidateCtxErr)
+	}
+}
+
+func TestListAppliesFiltersBeforePagination(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-01"] = domain.Task{ID: "id-01", Title: "todo", Status: domain.StatusTodo, Assignee: "alice"}
+	repo.tasks["id-02"] = domain.Task{ID: "id-02", Title: "done", Status: domain.StatusDone, Assignee: "alice"}
+	repo.tasks["id-03"] = domain.Task{ID: "id-03", Title: "other owner", Status: domain.StatusDone, Assignee: "bob"}
+
+	result, err := newService(repo).List(context.Background(), ListQuery{
+		Status: domain.StatusDone, Assignee: "alice", Page: 1, PageSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+
+	if want := (Filter{Status: domain.StatusDone, Assignee: "alice", Limit: 1, Offset: 0}); repo.lastFilter != want {
+		t.Fatalf("repository filter = %+v, want %+v", repo.lastFilter, want)
+	}
+	if result.Total != 1 || len(result.Tasks) != 1 || result.Tasks[0].ID != "id-02" {
+		t.Fatalf("result = %+v, want only the matching done task", result)
+	}
+}
+
+func TestListSecondPageOffset(t *testing.T) {
+	repo := newFakeRepo()
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprintf("id-%02d", i)
+		repo.tasks[id] = domain.Task{ID: id, Title: id, Status: domain.StatusTodo}
+	}
+
+	result, err := newService(repo).List(context.Background(), ListQuery{Page: 2, PageSize: 2})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+
+	if repo.lastFilter.Offset != 2 || repo.lastFilter.Limit != 2 {
+		t.Fatalf("filter = %+v, want offset 2 and limit 2", repo.lastFilter)
+	}
+	if result.Total != 3 || result.TotalPages != 2 || len(result.Tasks) != 1 || result.Tasks[0].ID != "id-03" {
+		t.Fatalf("result = %+v, want the last task on page 2 of 2", result)
+	}
+}
+
+func TestListBeyondLastPageKeepsTotal(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["id-01"] = domain.Task{ID: "id-01", Title: "only", Status: domain.StatusTodo}
+
+	result, err := newService(repo).List(context.Background(), ListQuery{Page: 5, PageSize: 2})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+
+	if result.Page != 5 || result.PageSize != 2 {
+		t.Fatalf("page = %d/%d, want the requested 5/2", result.Page, result.PageSize)
+	}
+	if result.Total != 1 || result.TotalPages != 1 {
+		t.Fatalf("total = %d, pages = %d; want the filtered 1/1", result.Total, result.TotalPages)
+	}
+	if result.Tasks == nil || len(result.Tasks) != 0 {
+		t.Fatalf("tasks = %#v, want a non-nil empty page", result.Tasks)
+	}
+}
+
+func TestListTotalPages(t *testing.T) {
+	tests := []struct {
+		total    int
+		pageSize int
+		want     int
+	}{
+		{total: 0, pageSize: 20, want: 0},
+		{total: 1, pageSize: 20, want: 1},
+		{total: 20, pageSize: 20, want: 1},
+		{total: 21, pageSize: 20, want: 2},
+		{total: 100, pageSize: 100, want: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%d/%d", tc.total, tc.pageSize), func(t *testing.T) {
+			repo := newFakeRepo()
+			for i := 0; i < tc.total; i++ {
+				id := fmt.Sprintf("id-%04d", i)
+				repo.tasks[id] = domain.Task{ID: id, Title: id, Status: domain.StatusTodo}
+			}
+
+			result, err := newService(repo).List(context.Background(), ListQuery{PageSize: tc.pageSize})
+			if err != nil {
+				t.Fatalf("List() unexpected error: %v", err)
+			}
+			if result.TotalPages != tc.want {
+				t.Fatalf("TotalPages = %d, want %d", result.TotalPages, tc.want)
+			}
+		})
+	}
+}
+
+func TestListNormalizesQueryForCache(t *testing.T) {
+	repo := newFakeRepo()
+	cache := &fakeCache{snapshot: ListSnapshot{Token: "gen-1"}}
+
+	// Trimmed assignee and explicit defaults must reach the cache in their
+	// canonical form, so equivalent requests share one entry.
+	if _, err := New(repo, cache, nil).List(context.Background(), ListQuery{
+		Assignee: "  alice  ", Page: 1, PageSize: DefaultPageSize,
+	}); err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+
+	want := ListQuery{Assignee: "alice", Page: 1, PageSize: DefaultPageSize}
+	if cache.lastGetQuery != want {
+		t.Fatalf("cache Get query = %+v, want %+v", cache.lastGetQuery, want)
+	}
+	if cache.lastSetQuery != want {
+		t.Fatalf("cache Set query = %+v, want %+v", cache.lastSetQuery, want)
+	}
+}
+
+func TestListCacheHitReturnsFullMetadata(t *testing.T) {
+	repo := newFakeRepo()
+	repo.tasks["db-task"] = domain.Task{ID: "db-task", Title: "from database", Status: domain.StatusTodo}
+
+	cached := ListResult{
+		Tasks:      []domain.Task{{ID: "cached", Title: "from cache", Status: domain.StatusDone}},
+		Page:       2,
+		PageSize:   5,
+		Total:      11,
+		TotalPages: 3,
+	}
+	cache := &fakeCache{snapshot: ListSnapshot{Result: cached, Token: "gen-1", Hit: true}}
+
+	result, err := New(repo, cache, nil).List(context.Background(), ListQuery{Page: 2, PageSize: 5})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if result.Page != 2 || result.PageSize != 5 || result.Total != 11 || result.TotalPages != 3 {
+		t.Fatalf("result = %+v, want the cached pagination metadata", result)
+	}
+	if repo.listCalls != 0 {
+		t.Fatalf("repository was called %d times on a cache hit, want 0", repo.listCalls)
+	}
+}
+
+func TestListRejectsInvalidQuery(t *testing.T) {
+	tests := []struct {
+		name  string
+		query ListQuery
+		field string
+	}{
+		{name: "unknown status", query: ListQuery{Status: "pending"}, field: "status"},
+		{name: "negative page", query: ListQuery{Page: -1}, field: "page"},
+		{name: "negative page size", query: ListQuery{PageSize: -1}, field: "page_size"},
+		{name: "page size above maximum", query: ListQuery{PageSize: MaxPageSize + 1}, field: "page_size"},
+		{name: "long assignee", query: ListQuery{Assignee: strings.Repeat("a", domain.MaxAssigneeLength+1)}, field: "assignee"},
+		{name: "overflowing page", query: ListQuery{Page: math.MaxInt64, PageSize: 100}, field: "page"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeRepo()
+			_, err := newService(repo).List(context.Background(), tc.query)
+
+			var validation *domain.ValidationError
+			if !errors.As(err, &validation) {
+				t.Fatalf("List() error = %v, want *domain.ValidationError", err)
+			}
+			if validation.Field != tc.field {
+				t.Fatalf("field = %q, want %q", validation.Field, tc.field)
+			}
+			if repo.listCalls != 0 {
+				t.Fatalf("repository was queried %d times for an invalid query", repo.listCalls)
+			}
+		})
+	}
+}
+
+func TestCreateTrimsAssigneeAndRejectsLongValues(t *testing.T) {
+	repo := newFakeRepo()
+	created, err := newService(repo).Create(context.Background(), Input{Title: "task", Assignee: "  alice  "})
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+	if created.Assignee != "alice" {
+		t.Fatalf("Assignee = %q, want the trimmed label", created.Assignee)
+	}
+
+	_, err = newService(repo).Create(context.Background(), Input{
+		Title: "task", Assignee: strings.Repeat("a", domain.MaxAssigneeLength+1),
+	})
+	var validation *domain.ValidationError
+	if !errors.As(err, &validation) || validation.Field != "assignee" {
+		t.Fatalf("Create() error = %v, want an assignee validation error", err)
 	}
 }

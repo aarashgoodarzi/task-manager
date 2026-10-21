@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Status is the lifecycle state of a task. The set is closed: any value not
@@ -50,12 +51,38 @@ func ParseStatus(raw string) (Status, error) {
 	return status, nil
 }
 
+// MaxAssigneeLength bounds the free-form assignee label. It is part of the
+// aggregate's contract, so the domain, the list filter, and the database check
+// constraint agree on the same limit.
+const MaxAssigneeLength = 100
+
+// ParseStatusFilter converts an optional list filter into a Status. Unlike
+// ParseStatus, an empty value means "any status" and returns the zero Status
+// rather than the write default, so a missing filter cannot silently select
+// todo only.
+func ParseStatusFilter(raw string) (Status, error) {
+	status := Status(strings.TrimSpace(raw))
+	if status == "" {
+		return "", nil
+	}
+	if !status.Valid() {
+		return "", &ValidationError{
+			Field:   "status",
+			Message: `status must be one of "todo", "in_progress", "done"`,
+		}
+	}
+	return status, nil
+}
+
 // Task is a single unit of work owned by the service.
 type Task struct {
 	ID          string
 	Title       string
 	Description string
 	Status      Status
+	// Assignee is a free-form label naming who owns the task. It is stored
+	// trimmed and empty means unassigned.
+	Assignee string
 }
 
 // Validate checks the aggregate invariants. Titles are trimmed before the
@@ -68,6 +95,12 @@ func (t Task) Validate() error {
 		return &ValidationError{
 			Field:   "status",
 			Message: `status must be one of "todo", "in_progress", "done"`,
+		}
+	}
+	if utf8.RuneCountInString(t.Assignee) > MaxAssigneeLength {
+		return &ValidationError{
+			Field:   "assignee",
+			Message: fmt.Sprintf("assignee must be at most %d characters", MaxAssigneeLength),
 		}
 	}
 	return nil

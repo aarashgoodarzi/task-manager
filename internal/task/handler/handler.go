@@ -7,9 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -22,7 +25,7 @@ import (
 // declared at the point of use, so the handler can be tested with a stub.
 type TaskService interface {
 	Create(ctx context.Context, in service.Input) (domain.Task, error)
-	List(ctx context.Context) ([]domain.Task, error)
+	List(ctx context.Context, query service.ListQuery) (service.ListResult, error)
 	Get(ctx context.Context, id string) (domain.Task, error)
 	Update(ctx context.Context, id string, in service.Input) (domain.Task, error)
 	Delete(ctx context.Context, id string) error
@@ -54,6 +57,7 @@ type taskRequest struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Status      string `json:"status"`
+	Assignee    string `json:"assignee"`
 }
 
 type taskResponse struct {
@@ -61,6 +65,17 @@ type taskResponse struct {
 	Title       string        `json:"title"`
 	Description string        `json:"description"`
 	Status      domain.Status `json:"status"`
+	Assignee    string        `json:"assignee"`
+}
+
+// taskListResponse is the paginated collection envelope. The metadata comes
+// from the same filtered set as the items, so page and total cannot disagree.
+type taskListResponse struct {
+	Items      []taskResponse `json:"items"`
+	Page       int            `json:"page"`
+	PageSize   int            `json:"page_size"`
+	Total      int64          `json:"total"`
+	TotalPages int            `json:"total_pages"`
 }
 
 func toResponse(task domain.Task) taskResponse {
@@ -69,6 +84,7 @@ func toResponse(task domain.Task) taskResponse {
 		Title:       task.Title,
 		Description: task.Description,
 		Status:      task.Status,
+		Assignee:    task.Assignee,
 	}
 }
 
@@ -82,6 +98,7 @@ func (h *Handler) create(c *gin.Context) {
 		Title:       req.Title,
 		Description: req.Description,
 		Status:      req.Status,
+		Assignee:    req.Assignee,
 	})
 	if err != nil {
 		h.writeError(c, err)
@@ -93,17 +110,28 @@ func (h *Handler) create(c *gin.Context) {
 }
 
 func (h *Handler) list(c *gin.Context) {
-	tasks, err := h.service.List(c.Request.Context())
+	query, ok := decodeListQuery(c)
+	if !ok {
+		return
+	}
+
+	result, err := h.service.List(c.Request.Context(), query)
 	if err != nil {
 		h.writeError(c, err)
 		return
 	}
 
-	responses := make([]taskResponse, 0, len(tasks))
-	for _, task := range tasks {
-		responses = append(responses, toResponse(task))
+	items := make([]taskResponse, 0, len(result.Tasks))
+	for _, task := range result.Tasks {
+		items = append(items, toResponse(task))
 	}
-	c.JSON(http.StatusOK, responses)
+	c.JSON(http.StatusOK, taskListResponse{
+		Items:      items,
+		Page:       result.Page,
+		PageSize:   result.PageSize,
+		Total:      result.Total,
+		TotalPages: result.TotalPages,
+	})
 }
 
 func (h *Handler) get(c *gin.Context) {
@@ -134,6 +162,7 @@ func (h *Handler) update(c *gin.Context) {
 		Title:       req.Title,
 		Description: req.Description,
 		Status:      req.Status,
+		Assignee:    req.Assignee,
 	})
 	if err != nil {
 		h.writeError(c, err)
@@ -153,6 +182,100 @@ func (h *Handler) delete(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// listQueryParams is the closed set of parameters GET /tasks accepts. Unknown
+// names are rejected rather than ignored, so a typo cannot silently return an
+// unfiltered collection.
+var listQueryParams = map[string]struct{}{
+	"status":    {},
+	"assignee":  {},
+	"page":      {},
+	"page_size": {},
+}
+
+// decodeListQuery parses and validates the collection query string. It writes
+// the error envelope itself and reports whether the request may continue.
+// Range rules (page >= 1, page_size <= MaxPageSize, assignee length, overflow)
+// live in the use case and are reported with the same envelope.
+func decodeListQuery(c *gin.Context) (service.ListQuery, bool) {
+	values := c.Request.URL.Query()
+	fields := make(map[string]string)
+
+	for name := range values {
+		if _, ok := listQueryParams[name]; !ok {
+			fields[name] = "unsupported query parameter"
+		}
+	}
+
+	var query service.ListQuery
+
+	if values.Has("status") {
+		status, err := domain.ParseStatusFilter(values.Get("status"))
+		switch {
+		case err != nil:
+			fields["status"] = `must be one of "todo", "in_progress", "done"`
+		case status == "":
+			fields["status"] = "must not be empty"
+		default:
+			query.Status = status
+		}
+	}
+
+	if values.Has("assignee") {
+		assignee := strings.TrimSpace(values.Get("assignee"))
+		if assignee == "" {
+			fields["assignee"] = "must not be empty"
+		} else {
+			query.Assignee = assignee
+		}
+	}
+
+	if values.Has("page") {
+		page, err := strconv.Atoi(values.Get("page"))
+		switch {
+		case err != nil:
+			fields["page"] = "must be a whole number"
+		case page < 1:
+			// An explicit zero is a client error; only an omitted page uses
+			// the default, so the two cases cannot be confused.
+			fields["page"] = "must be at least 1"
+		default:
+			query.Page = page
+		}
+	}
+
+	if values.Has("page_size") {
+		pageSize, err := strconv.Atoi(values.Get("page_size"))
+		switch {
+		case err != nil:
+			fields["page_size"] = "must be a whole number"
+		case pageSize < 1:
+			fields["page_size"] = "must be at least 1"
+		case pageSize > service.MaxPageSize:
+			fields["page_size"] = fmt.Sprintf("must be at most %d", service.MaxPageSize)
+		default:
+			query.PageSize = pageSize
+		}
+	}
+
+	if len(fields) == 0 {
+		normalized, err := query.Normalize()
+		if err != nil {
+			var validation *domain.ValidationError
+			if errors.As(err, &validation) {
+				fields[validation.Field] = validation.Message
+			} else {
+				fields["query"] = "invalid query parameters"
+			}
+		} else {
+			return normalized, true
+		}
+	}
+
+	infraHandler.Write(c, http.StatusBadRequest, infraHandler.CodeValidationFailed,
+		"invalid query parameters", fields)
+	return service.ListQuery{}, false
 }
 
 // decodeTaskRequest strictly decodes a single JSON object. Unknown fields and
