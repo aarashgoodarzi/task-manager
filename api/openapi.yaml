@@ -437,7 +437,6 @@ components:
         type: string
         minLength: 1
         maxLength: 100
-        example: alice
     Page:
       name: page
       in: query
@@ -450,7 +449,6 @@ components:
         type: integer
         minimum: 1
         default: 1
-        example: 2
     PageSize:
       name: page_size
       in: query
@@ -461,7 +459,6 @@ components:
         minimum: 1
         maximum: 100
         default: 20
-        example: 20
   headers:
     RequestId:
       description: |
@@ -592,7 +589,6 @@ components:
           description: |
             Who owns the task, as a free-form label. Empty when unassigned.
             Trimmed of leading and trailing whitespace; at most 100 characters.
-          example: alice
     TaskWrite:
       type: object
       description: |
@@ -625,7 +621,6 @@ components:
           description: |
             Optional owner label, trimmed before storage. Omitting it (or
             sending an empty string) stores the task as unassigned.
-          example: alice
     TaskStatus:
       type: string
       description: A task's workflow state.
