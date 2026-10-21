@@ -25,6 +25,7 @@ func clearConfigEnv(t *testing.T) {
 		"REDIS_CACHE_TTL",
 		"LOG_LEVEL",
 		"METRICS_TASKS_REFRESH_INTERVAL",
+		"PPROF_ADDR",
 	} {
 		t.Setenv(key, "")
 	}
@@ -56,6 +57,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Metrics.TasksRefreshInterval != 15*time.Second {
 		t.Fatalf("Metrics.TasksRefreshInterval = %v, want 15s", cfg.Metrics.TasksRefreshInterval)
 	}
+	if cfg.Profile.Addr != "" {
+		t.Fatalf("Profile.Addr = %q, want empty default (pprof disabled)", cfg.Profile.Addr)
+	}
 }
 
 func TestLoadReadsEnvOverrides(t *testing.T) {
@@ -69,6 +73,7 @@ func TestLoadReadsEnvOverrides(t *testing.T) {
 	t.Setenv("METRICS_TASKS_REFRESH_INTERVAL", "30s")
 	t.Setenv("REDIS_URL", "redis://localhost:6379/3")
 	t.Setenv("REDIS_CACHE_TTL", "2m")
+	t.Setenv("PPROF_ADDR", "127.0.0.1:6060")
 
 	cfg := Load()
 
@@ -95,6 +100,9 @@ func TestLoadReadsEnvOverrides(t *testing.T) {
 	}
 	if cfg.Metrics.TasksRefreshInterval != 30*time.Second {
 		t.Fatalf("Metrics.TasksRefreshInterval = %v, want 30s", cfg.Metrics.TasksRefreshInterval)
+	}
+	if cfg.Profile.Addr != "127.0.0.1:6060" {
+		t.Fatalf("Profile.Addr = %q, want 127.0.0.1:6060", cfg.Profile.Addr)
 	}
 }
 

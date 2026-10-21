@@ -24,6 +24,7 @@ file and the older record is marked `Superseded by NNNN`.
 | [0012](0012-consumer-owned-ports-dependency-audit.md) | Consumer-owned ports remain the dependency-inversion boundary | Accepted | Whole repository; audited `internal/task/**`, `internal/infra/**`, `internal/app/`, `cmd/` |
 | [0013](0013-redis-cache-aside-for-task-list.md) | Redis cache-aside for task listing with generation-token invalidation | Accepted | `internal/task/service/`, `internal/task/cache/redis/`, `internal/infra/config/`, `internal/app/`, `compose.yaml`, CI, README |
 | [0014](0014-task-filtering-and-pagination.md) | Task filtering and pagination on a paginated collection envelope | Accepted | `internal/task/**`, migrations, schema verification, `api/openapi.yaml`, README |
+| [0015](0015-load-testing-and-profiling.md) | Load testing `GET /tasks` with a small Go runner and opt-in profiling | Accepted | `cmd/loadtest/`, `internal/infra/config/`, `internal/app/`, README |
 
 ## When to write one
 

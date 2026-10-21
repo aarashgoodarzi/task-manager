@@ -7,9 +7,12 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -33,6 +36,11 @@ const databaseStartupTimeout = 5 * time.Second
 // Redis cache is configured. Redis is optional, so this never fails startup.
 const cacheStartupTimeout = 2 * time.Second
 
+// profilerShutdownTimeout bounds how long a graceful stop waits for an
+// in-flight pprof capture. A CPU profile streams for its requested duration,
+// so shutdown does not wait indefinitely for one to finish.
+const profilerShutdownTimeout = 5 * time.Second
+
 // App holds every top-level dependency created during Initialize.
 type App struct {
 	cfg         config.Config
@@ -43,6 +51,8 @@ type App struct {
 	taskCount   *infraMetrics.TaskCountRefresher
 	cache       service.ListCache
 	cacheCloser io.Closer
+	profiler    *http.Server
+	profileLn   net.Listener
 	server      *server.Server
 }
 
@@ -135,6 +145,19 @@ func (a *App) Initialize() error {
 		_ = db.Close()
 		return fmt.Errorf("app: initialize metrics: %w", err)
 	}
+	// Profiling is opt-in and lives on its own loopback listener. It is bound
+	// before the API server so a rejected address fails startup, and it is
+	// never part of the Gin route table.
+	if a.cfg.Profile.Addr != "" {
+		profiler, listener, profileErr := newProfilerServer(a.cfg.Profile.Addr, a.log)
+		if profileErr != nil {
+			_ = db.Close()
+			return fmt.Errorf("app: initialize profiler: %w", profileErr)
+		}
+		a.profiler = profiler
+		a.profileLn = listener
+	}
+
 	// HTTP modules contribute routes through buildHandlers, so Initialize does
 	// not grow an argument per module when a feature is added.
 	a.server = server.New(server.Config{
@@ -165,7 +188,31 @@ func (a *App) Start() error {
 		}()
 	}
 
+	// The profiling server has no background work of its own; it is started
+	// alongside the API server and stopped as soon as the API server returns.
+	profileDone := make(chan struct{})
+	if a.profiler != nil {
+		go func() {
+			defer close(profileDone)
+			if serveErr := a.profiler.Serve(a.profileLn); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				a.log.Error("pprof listener failed", slog.Any("error", serveErr))
+			}
+		}()
+	}
+
 	runErr := a.server.Run(ctx)
+
+	// Stop profiling before tearing down the dependencies a capture may still
+	// be reading, and wait for the listener goroutine so shutdown leaves no
+	// stray goroutine behind.
+	if a.profiler != nil {
+		shutdownCtx, cancelProfile := context.WithTimeout(context.Background(), profilerShutdownTimeout)
+		if shutdownErr := a.profiler.Shutdown(shutdownCtx); shutdownErr != nil {
+			a.log.Warn("pprof listener did not stop cleanly", slog.Any("error", shutdownErr))
+		}
+		cancelProfile()
+		<-profileDone
+	}
 
 	// Cancel the refresher before closing the pool and wait for it, so an
 	// in-flight count query returns a cancellation error instead of racing a

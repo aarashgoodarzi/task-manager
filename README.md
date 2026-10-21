@@ -290,6 +290,7 @@ loaded in the composition root described by
 | `REDIS_CACHE_TTL` | No | `60s` | Lifetime of a cached `GET /tasks` page. Every query variant uses it. Must be positive; zero, negative, and unparsable values fall back to `60s`. |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warn`, or `error`; any other value falls back to `info`. |
 | `METRICS_TASKS_REFRESH_INTERVAL` | No | `15s` | How often `tasks_count` is re-read from PostgreSQL. Zero, negative, and unparsable values fall back to `15s`. |
+| `PPROF_ADDR` | No | *(empty)* | Opt-in `net/http/pprof` listener, for example `127.0.0.1:6060`. Empty disables profiling. Non-loopback values abort startup. It is a separate listener, never a route on the API port, and is not wired into `compose.yaml`. |
 | `TEST_DATABASE_URL` | No | *(empty)* | Test-only DSN for PostgreSQL integration tests; the service ignores it. |
 | `TEST_REDIS_URL` | No | *(empty)* | Test-only Redis URL for integration tests; the service ignores it. Point it at a disposable server. |
 | `GIN_MODE` | No | `debug` | Read by Gin, not by the application configuration. `release` silences Gin's debug output. |
@@ -309,6 +310,11 @@ Behavior worth knowing:
   with a warning instead of aborting startup. Redis is never required for
   PostgreSQL-backed reads or writes, and cache failures fall back to the
   database.
+- `PPROF_ADDR` must name a loopback host and port (`127.0.0.1:6060`,
+  `[::1]:6060`, `localhost:6060`). `0.0.0.0:6060` and `:6060` are rejected
+  because they would expose profiles on every interface. The listener is
+  closed during shutdown, and an in-flight capture is given five seconds to
+  finish.
 
 ### Docker Compose variables
 
@@ -1037,6 +1043,8 @@ The configuration tests clear the variables they assert on, so a preset `PORT`,
 | Compile every package | `go build ./...` |
 | Apply migrations | `make migrate` or `go run ./cmd/migrate` |
 | Validate the OpenAPI document | `npx --yes @redocly/cli@2.66.0 lint api/openapi.yaml` |
+| Load-test `GET /tasks` | `go run ./cmd/loadtest -base-url http://127.0.0.1:8080 -seed 2000` |
+| Capture and inspect a CPU profile | See [Performance testing and profiling](#performance-testing-and-profiling) |
 
 Important details:
 
@@ -1044,7 +1052,7 @@ Important details:
   not rewrite files or fail. Use `gofmt -w .` to fix them. CI fails when any file
   is listed.
 - `coverage.out` matches `*.out` in `.gitignore`.
-- Measured statement coverage on this tree is **80.8%** with PostgreSQL and
+- Measured statement coverage on this tree is **76.6%** with PostgreSQL and
   Redis, and lower without them. The PostgreSQL and Redis adapters only execute
   in their integration tiers.
 - `make coverage-check` enforces `COVERAGE_MIN` (default `70`) on the combined
@@ -1085,6 +1093,10 @@ Important details:
   and that two variants cannot answer each other. Integration tests repeat the
   command-level behavior against a real Redis server, including expiration,
   variant isolation, whole-family invalidation, and concurrent first reads.
+- `cmd/loadtest` tests cover nearest-rank percentiles, failure accounting,
+  request timeouts, exit-status mapping, option validation, dataset
+  seeding/cleanup bookkeeping, and base-URL handling. The live scenario and the
+  numbers in this README are produced manually against a running service.
 - The PostgreSQL suite covers filtering by status and assignee (alone and
   combined), total counts that use the same filter as the page, deterministic
   non-overlapping pages, beyond-the-last pages, SQL parameter binding for filter
@@ -1102,6 +1114,198 @@ Important details:
 - Redocly is a development-only Node.js tool. It is not a Go dependency and is
   not needed to build, test, or run the service. The current document has one
   advisory warning about its absent `license` field, not a validation error.
+
+### Performance testing and profiling
+
+`cmd/loadtest` is a small Go load generator for `GET /tasks`. It exists to answer
+one question reproducibly: how does the task-list endpoint behave under a fixed
+request count and concurrency, and what changes when the Redis cache is bypassed?
+It is a measurement tool, not a service dependency, and it makes no attempt to
+be a general benchmarking framework. The decision is recorded in
+[ADR 0015](decisions/0015-load-testing-and-profiling.md).
+
+**Prerequisites**
+
+- A running service with a migrated database, reached over HTTP.
+- Go toolchain on the host (the tool is built from this repository).
+- Optional: Redis for the warm/miss comparison and `curl` plus Go tooling for
+  profiles.
+- A disposable local database. The tool creates and deletes its own tasks; do
+  not point `-seed` at shared or production data.
+
+**Dataset preparation**
+
+`-seed 2000` first reads `total` from `GET /tasks?page=1&page_size=1`, creates
+2000 tasks through `POST /task` with a run-unique title
+(`loadtest-<unix-nano>-<n>`, assignee `loadtest`), then re-reads `total` and
+aborts if the count is not `baseline + 2000`. After the measured phase it
+deletes exactly the IDs it created (a `404` is accepted) and reports how many
+were removed. Tasks that already exist are never touched, and a second run does
+not accumulate rows. If the process is killed mid-run, the leftover rows are
+identifiable by the `loadtest-` title prefix and the `loadtest` assignee; the
+next run still measures its own 2000 new tasks on top of them, and `total` in
+the output makes that visible. `-keep` skips the deletion when you want to
+inspect the rows.
+
+Mutations are refused against a non-loopback host unless
+`-allow-remote-mutations` is passed.
+
+**Running the scenario**
+
+```bash
+# Warm: one query variant, cache primed by a short warmup, then measured.
+go run ./cmd/loadtest \
+  -base-url http://127.0.0.1:8080 \
+  -query 'page=1&page_size=20' \
+  -requests 50000 -concurrency 16 -timeout 5s \
+  -seed 2000 \
+  -redis-url redis://localhost:6379/0
+
+# Cache-miss: every request must reach PostgreSQL.
+go run ./cmd/loadtest \
+  -base-url http://127.0.0.1:8080 \
+  -query 'page=1&page_size=20' \
+  -mode miss -concurrency 1 -requests 1000 -timeout 5s \
+  -seed 2000 \
+  -redis-url redis://localhost:6379/0
+```
+
+Flags: `-base-url`, `-query`, `-requests`, `-concurrency`, `-timeout`,
+`-warmup`, `-mode warm|miss`, `-redis-url`, `-redis-prefix`, `-seed`, `-keep`,
+`-allow-remote-mutations`. `-requests` is capped at one million and
+`-concurrency` at 4096, so the latency and success bookkeeping (about 9 bytes
+per request) and the goroutine count stay bounded. Each worker is a fixed goroutine that performs
+requests sequentially; no request spawns another goroutine.
+
+The report contains total, successful, and failed requests, wall-clock duration
+from `time.Since` around the measured phase, throughput, mean, nearest-rank p50,
+p95, p99, and maximum latency. Latency samples are per-request observed
+durations of successful requests only; failures are counted and excluded so a
+fast rejection cannot flatter the percentiles. The first three failure messages
+(status code or transport error) are printed; response bodies are never read
+into the report. The process exits `0` only when every request succeeded, `1`
+when requests failed or cleanup did not finish, and `2` for invalid options.
+
+**Measured results**
+
+Measured on 2026-10-21 against a local build of this tree. Dataset: 2000 tasks
+created by the tool, page `1`, `page_size=20`, no filter. Redis list cache
+enabled (`REDIS_CACHE_TTL=60s`).
+
+| Scenario | Requests | Concurrency | Throughput | Mean | p50 | p95 | p99 | Max | Failed |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Warm cache | 200000 | 16 | 13239 req/s | 1.21 ms | 1.17 ms | 1.61 ms | 2.10 ms | 7.13 ms | 0 |
+| Warm cache | 50000 | 16 | 12937 req/s | 1.23 ms | 1.18 ms | 1.69 ms | 2.39 ms | 6.10 ms | 0 |
+| Warm cache | 1000 | 1 | 2470 req/s | 0.40 ms | 0.40 ms | 0.48 ms | 0.54 ms | 1.14 ms | 0 |
+| Cache miss | 1000 | 1 | 933 req/s | 0.90 ms | 0.84 ms | 1.27 ms | 1.34 ms | 3.76 ms | 0 |
+
+The single-threaded pair is the only directly comparable cache comparison: both
+send the same 1000 requests to the same 2000-row dataset, one from Redis and one
+from PostgreSQL. Warm was 2.65× the throughput and had a p50 0.44 ms lower
+(400 µs versus 840 µs) in this environment. The 16-way runs reach 13.2k req/s
+with a p99 of 2.1–2.4 ms, but they are not compared against a concurrent miss
+scenario, because one request repopulating the cache would turn later requests
+into hits and the run could not be labelled a miss.
+
+**How the cache path was verified**
+
+When `-redis-url` is supplied the tool reads Redis `keyspace_hits` and
+`keyspace_misses` before and after the measured phase, and counts list keys
+(`<prefix>:tasks:list:*`) before and after:
+
+- Warm run of 200000: `hits +400000, misses +0`, list keys unchanged. Two hits
+  per request is the generation read plus the list read, so every measured
+  request was served from Redis.
+- Warm run of 1000 at concurrency 1: `hits +2000, misses +0`.
+- Miss run of 1000: `hits +1000, misses +1000`, list keys `10 -> 1010`. Each
+  request replaced the generation token with 128 fresh random bits before its
+  timed GET, so the following lookup addressed a generation that had never been
+  cached; the single generation read is a hit, the variant read is a miss, and
+  exactly one new list key is written per request. `-mode miss` requires
+  `-concurrency 1` for that reason: with parallel requests the first miss would
+  repopulate the cache and later requests would be hits.
+
+Redis counters are server-wide, so the numbers would include any other client
+of that Redis instance. The measurements above used a dedicated database (`/1`)
+and no other client traffic was generated during the measured phases.
+
+**Profiling**
+
+`PPROF_ADDR` enables `net/http/pprof` on its own loopback listener. It is empty
+by default, rejected for non-loopback addresses, never registered on the Gin
+router, and not set in `compose.yaml`. Keep it unset for anything but local
+diagnostics.
+
+```bash
+# Terminal 1: build once so profiles resolve against the exact binary, then
+# run it with profiling enabled against a disposable database.
+make build
+export DATABASE_URL='postgres:///task_manager_bench?host=localhost&sslmode=disable'
+export REDIS_URL='redis://localhost:6379/0'
+export PPROF_ADDR='127.0.0.1:6060'
+PORT=8080 ./task-manager
+
+# Terminal 2: start the capture, then generate load for at least as long.
+curl -sS -o cpu-warm.pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20' &
+go run ./cmd/loadtest -base-url http://127.0.0.1:8080 -requests 200000 -concurrency 16 \
+  -seed 2000 -redis-url redis://localhost:6379/0
+wait
+
+# Inspect the captured profile with the binary under test.
+go tool pprof -top -nodecount=20 ./task-manager cpu-warm.pprof
+go tool pprof -top -cum -focus='task-manager/internal' ./task-manager cpu-warm.pprof
+go tool pprof -http=127.0.0.1:8084 ./task-manager cpu-warm.pprof
+```
+
+`*.pprof` is ignored by Git so profiles and binaries are not committed.
+
+**What the captured profile showed**
+
+The capture above ran for 20.07 s and recorded 28.03 s of samples (139.7% of
+wall time, about 1.4 cores) during the 200000-request warm run. The window also
+contains about 0.75 s of dataset creation and the start of cleanup, a small
+fraction of the samples. Top entries by flat time:
+
+| Frame | Flat | Meaning |
+| --- | --- | --- |
+| `syscall.rawsyscalln` | 46.8% | Socket reads and writes for HTTP and Redis, i.e. I/O time |
+| `runtime.pthread_cond_wait` | 14.3% | Blocked goroutines in the runtime and netpoller |
+| `runtime.kevent` | 10.8% | kqueue wait on the loopback sockets |
+| `runtime.usleep` | 6.8% | Runtime scheduling waits |
+| `runtime.pthread_cond_signal` | 5.4% | Waking goroutines for completed I/O |
+
+Cumulative application time: `Handler.list` 29.2%, `cache.Get` / `Service.List`
+27.0%, `go-redis` `Client.Process` 21.1%, and `encoding/json` (request parse plus
+response encoding) 7.1%. Garbage collection is small (`gcDrain` about 2.5% cum).
+In other words, a warm list request is dominated by socket I/O and Redis client
+work, not by JSON, allocation, or routing; there is no single hot function to
+optimize in the handler. The profile measures this service and this client on
+the same machine, so client CPU and server CPU share the host.
+
+A heap profile is a separate measurement and was not needed here. If you want
+one, capture it while the load runs and inspect it the same way:
+
+```bash
+curl -sS -o heap.pprof 'http://127.0.0.1:6060/debug/pprof/heap'
+go tool pprof -top ./task-manager heap.pprof
+```
+
+**Environment and limits**
+
+- macOS 26.3, arm64, 10 logical CPUs, 16 GB RAM; Go 1.26.2 (`darwin/arm64`).
+- PostgreSQL 14.13 (Homebrew) on loopback with `shared_buffers=128MB`,
+  `max_connections=100`, and `fsync=on`; the service used its default pool
+  (10 open, 5 idle).
+- Redis 7.4.11 in the Compose container (Linux VM, published on
+  `127.0.0.1:6379`, no `maxmemory`); the benchmark used database `1`.
+- Service run as a local process (not the container image) with default
+  `LOG_LEVEL=info`, so per-request logging was active, on the same host as the
+  load generator. Client and server therefore compete for the same cores.
+- Redis traffic crosses the Docker VM boundary on macOS, which inflates warm
+  latency relative to a native Redis.
+- Results depend on dataset size, hardware, PostgreSQL configuration, log level,
+  page/page_size, and whether the client is co-located. Re-run the commands on
+  your machine instead of treating these numbers as a general benchmark.
 
 ### Continuous integration
 
@@ -1254,6 +1458,7 @@ A few operational constraints are worth repeating:
 | Integration tests skip with `TEST_REDIS_URL is not set` | The Redis integration tier was not enabled | Start Redis (`docker compose up -d redis`) and export `TEST_REDIS_URL` |
 | `make coverage-check` refuses to run | `TEST_DATABASE_URL` or `TEST_REDIS_URL` is unset | Provide both test URLs; the gate intentionally requires both adapter tiers |
 | `bind: address already in use` on `:8080` | Another process uses the port | Run `PORT=9090 make run`, or publish `APP_PORT=9090` with Compose |
+| Startup fails with `PPROF_ADDR "0.0.0.0:6060" must bind a loopback address` | Profiling was enabled on a non-loopback address | Use `PPROF_ADDR=127.0.0.1:6060`; the listener is deliberately loopback-only and separate from the API port |
 | `docker compose` cannot connect the app to PostgreSQL | The `migrate` service failed or PostgreSQL is unhealthy | Check `docker compose ps`, `docker compose logs postgres`, and `docker compose logs migrate`; the app waits for both |
 | Tasks disappear after `docker compose down` | The volume was removed with `-v` | Use `docker compose down` without `-v`; `down -v` is intentionally destructive |
 | Requests return `500` after PostgreSQL restarts | The process is still running but the database is unavailable | Check database health and logs; restart the service once PostgreSQL is ready |
@@ -1279,6 +1484,7 @@ A few operational constraints are worth repeating:
 │   ├── openapi.go                  embeds the contract as api.OpenAPI
 │   └── openapi.yaml                canonical OpenAPI 3.0.3 contract
 ├── cmd/
+│   ├── loadtest/                   HTTP load generator for GET /tasks
 │   ├── migrate/                    applies embedded migrations and exits
 │   └── task-manager/               process entry point
 ├── decisions/                      Architecture Decision Records and index
@@ -1333,6 +1539,7 @@ as the practical guide for setup, operation, and the current API.
 | [0012. Consumer-owned ports remain the dependency-inversion boundary](decisions/0012-consumer-owned-ports-dependency-audit.md) | Audit the import graph against the dependency rule: ports stay with consumers, adapters and the composition root point inward, and no production code needed to change. | Accepted |
 | [0013. Redis cache-aside for task listing with generation-token invalidation](decisions/0013-redis-cache-aside-for-task-list.md) | Cache `GET /tasks` in Redis with a generation token; invalidate after committed creates, updates, and deletes, and fail open to PostgreSQL when Redis is unavailable. | Accepted |
 | [0014. Task filtering and pagination on a paginated collection envelope](decisions/0014-task-filtering-and-pagination.md) | Add `status`/`assignee` filters and `page`/`page_size` pagination over `id`-ordered SQL, returning `items` plus totals; cache one entry per normalized query under the existing generation. | Accepted |
+| [0015. Load testing `GET /tasks` with a small Go runner and opt-in profiling](decisions/0015-load-testing-and-profiling.md) | Measure the list endpoint with a reproducible, self-contained HTTP runner and a loopback-only pprof listener; report measured numbers instead of targets. | Accepted |
 
 No record is superseded or deprecated. ADRs 0003, 0004, and 0007 carry amendment
 notes because later records refine part of their decision; read the amending ADR

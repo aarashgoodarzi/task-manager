@@ -163,6 +163,20 @@ func TestMethodNotAllowedReturnsErrorEnvelope(t *testing.T) {
 	}
 }
 
+// TestPublicRouterDoesNotExposePprof guards the invariant that profiling is
+// never reachable through the API listener: pprof lives behind its own opt-in
+// loopback server (see internal/app/profiler.go).
+func TestPublicRouterDoesNotExposePprof(t *testing.T) {
+	s := newTestServer(t, nil, swagger.New())
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/profile", "/debug/pprof/heap"} {
+		rec := serve(s, http.MethodGet, path)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404 (pprof must not be on the public router)", path, rec.Code)
+		}
+	}
+}
+
 func TestModulesRegisterRoutes(t *testing.T) {
 	registrar := &stubRegistrar{}
 	s := newTestServer(t, nil, registrar)

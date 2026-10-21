@@ -17,6 +17,7 @@ type Config struct {
 	Redis    RedisConfig
 	Logger   LoggerConfig
 	Metrics  MetricsConfig
+	Profile  ProfileConfig
 }
 
 // ServerConfig drives the HTTP server listener and timeouts.
@@ -69,6 +70,17 @@ type MetricsConfig struct {
 // negligible for this service.
 const defaultTasksRefreshInterval = 15 * time.Second
 
+// ProfileConfig controls the optional net/http/pprof listener.
+//
+// It is empty by default: profiling is an opt-in local diagnostic, never part
+// of the normal service surface. When set, the app binds a separate loopback
+// listener; PPROF_ADDR is never mounted on the public API router.
+type ProfileConfig struct {
+	// Addr is the loopback listen address for pprof, e.g. 127.0.0.1:6060.
+	// Empty disables profiling.
+	Addr string
+}
+
 // Load reads environment variables and applies defaults for anything unset.
 // It performs no validation that requires other packages (e.g. it does not
 // dial the database); callers decide how to react to empty required values.
@@ -109,6 +121,9 @@ func Load() Config {
 		},
 		Metrics: MetricsConfig{
 			TasksRefreshInterval: tasksRefreshInterval,
+		},
+		Profile: ProfileConfig{
+			Addr: env("PPROF_ADDR", ""),
 		},
 	}
 }
