@@ -830,23 +830,24 @@ then `Start`. The composition root performs the actual wiring:
 5. `Initialize` pings with a five-second budget and calls
    `database.VerifySchema`, which requires the `tasks` table and the columns the
    binary reads (`assignee`). A failure closes the pool and stops startup.
-6. The task repository is constructed once and shared by the metrics refresher
-   and the task module.
-7. If `REDIS_URL` is set, the Redis cache adapter is constructed. It does not
+6. If `REDIS_URL` is set, the Redis cache adapter is constructed. It does not
    dial at construction. One best-effort generation reset runs at startup; an
    invalid URL or an unavailable server is logged, and the service continues
    with caching disabled or reads bypassed. Redis never stops startup.
-8. `metrics.New` builds a dedicated Prometheus registry, and a
-   `TaskCountRefresher` is wired to the task repository with the configured
-   refresh interval.
-9. `buildHandlers` (in `internal/app/wiring.go`) composes the HTTP modules —
-   the task handler over the repository and list-cache ports, plus the docs
-   adapter — and returns them as `server.RouteRegistrar` values.
-10. `server.New` receives the pool as the health checker, the metrics adapter
-    as `Instrumentation`, and the registrars returned by `buildHandlers`. It
-    builds the router with `gin.Recovery()`, request-ID and completion
-    middleware, health routes, `/metrics`, `/swagger/`, and feature routes.
-11. `Start` installs a signal context for `SIGINT`/`SIGTERM`, starts the
+7. `metrics.New` builds a dedicated Prometheus registry, and a
+   `TaskCountRefresher` is wired to its own task-repository adapter over the
+   shared pool with the configured refresh interval.
+8. `buildHandlers` (in `internal/app/wiring.go`) constructs the task
+   repository from the App pool, wires the task service (repository + optional
+   list cache + logger) into the task HTTP handler, and returns that handler
+   plus the docs adapter as `server.RouteRegistrar` values. Feature repository
+   construction for HTTP modules lives here so `server.New` never enumerates
+   repositories ([ADR 0017](decisions/0017-encapsulate-handler-repository-wiring.md)).
+9. `server.New` receives timeouts, the pool as the health checker, the metrics
+   adapter as `Instrumentation`, and the registrars from `buildHandlers()`. It
+   builds the router with `gin.Recovery()`, request-ID and completion
+   middleware, health routes, `/metrics`, `/swagger/`, and feature routes.
+10. `Start` installs a signal context for `SIGINT`/`SIGTERM`, starts the
     task-count refresher, runs the server, shuts it down with a ten-second
     budget, stops and waits for the refresher, closes the Redis client if one
     is configured, and then closes the PostgreSQL pool.
@@ -1578,7 +1579,8 @@ as the practical guide for setup, operation, and the current API.
 | [0008. Containerized local environment and a 70% coverage gate on the combined suite](decisions/0008-containers-and-coverage-gate.md) | Ship a multi-stage image, model migrations as a Compose service, and enforce 70% coverage on the combined suite. | Accepted |
 | [0009. A checked-in OpenAPI document as the HTTP contract](decisions/0009-openapi-contract.md) | Make [`api/openapi.yaml`](api/openapi.yaml) the canonical contract and serve it with embedded Swagger UI; no code generation. | Accepted |
 | [0010. Prometheus metrics and request correlation for HTTP observability](decisions/0010-prometheus-metrics-and-request-correlation.md) | Expose bounded request metrics, an eventually consistent PostgreSQL-backed task gauge, and `X-Request-ID` correlation from a dedicated registry; no OpenTelemetry. | Accepted |
-| [0011. One composition point for HTTP module handlers](decisions/0011-http-handler-composition.md) | Compose HTTP modules through `buildHandlers` returning `server.RouteRegistrar` values; keep lifecycle in the composition root and avoid a plugin framework. | Accepted |
+| [0011. One composition point for HTTP module handlers](decisions/0011-http-handler-composition.md) | Compose HTTP modules through `buildHandlers` returning `server.RouteRegistrar` values; keep lifecycle in the composition root and avoid a plugin framework. | Accepted (amended by 0017) |
+| [0017. Encapsulate repository construction inside handler composition](decisions/0017-encapsulate-handler-repository-wiring.md) | Construct feature repositories inside `buildHandlers` so `server.New` never enumerates them. | Accepted |
 | [0012. Consumer-owned ports remain the dependency-inversion boundary](decisions/0012-consumer-owned-ports-dependency-audit.md) | Audit the import graph against the dependency rule: ports stay with consumers, adapters and the composition root point inward, and no production code needed to change. | Accepted |
 | [0013. Redis cache-aside for task listing with generation-token invalidation](decisions/0013-redis-cache-aside-for-task-list.md) | Cache `GET /tasks` in Redis with a generation token; invalidate after committed creates, updates, and deletes, and fail open to PostgreSQL when Redis is unavailable. | Accepted |
 | [0014. Task filtering and pagination on a paginated collection envelope](decisions/0014-task-filtering-and-pagination.md) | Add `status`/`assignee` filters and original page-number pagination (later replaced by cursor pagination). | Accepted (pagination superseded by 0016) |

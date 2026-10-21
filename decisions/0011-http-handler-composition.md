@@ -1,18 +1,21 @@
 # 0011. One composition point for HTTP module handlers
 
-* Status: Accepted
+* Status: Accepted (repository construction for HTTP modules amended by
+  [0017](0017-encapsulate-handler-repository-wiring.md))
 * Date: 2026-10-21
 * Scope: `internal/app/`, `internal/infra/server/`,
   `internal/task/handler/`, `internal/infra/swagger/`
 * Related: [0002](0002-package-layout-and-composition-root.md) — a single
   composition root owns concrete wiring; [0005](0005-task-crud-api.md) — the
   task HTTP adapter and its routes; [0009](0009-openapi-contract.md) — the docs
-  adapter is registered like a feature handler.
+  adapter is registered like a feature handler;
+  [0017](0017-encapsulate-handler-repository-wiring.md) — moves feature
+  repository construction into `buildHandlers`.
 
 ## Context
 
 `internal/infra/server` already declares a narrow `RouteRegistrar` port and
-accepts modules as a variadic argument. `server.New` builds the router,
+accepts a composed module list. `server.New` builds the router,
 installs the request-ID and completion middleware, mounts `/health`, `/metrics`,
 and the `404`/`405` handlers, and then lets each registrar mount its own routes.
 The infrastructure side of module registration was therefore solved.
@@ -54,36 +57,37 @@ The constraints come from the existing decisions:
 `internal/app/wiring.go` declares a single composition function:
 
 ```go
-func (a *App) buildHandlers(tasks service.Repository) []server.RouteRegistrar {
+func (a *App) buildHandlers() []server.RouteRegistrar {
+	tasks := postgres.New(a.db)
 	return []server.RouteRegistrar{
-		handler.New(service.New(tasks), a.log),
+		handler.New(service.New(tasks, a.cache, a.log), a.log),
 		swagger.New(),
 	}
 }
 ```
 
-`Initialize` constructs the shared adapters — pool, task repository, metrics
+`Initialize` constructs shared process adapters — pool, optional cache, metrics
 registry, and task-count refresher — and hands the result of `buildHandlers` to
-the server:
+the server. Feature repository construction for HTTP modules is owned by
+`buildHandlers` ([ADR 0017](0017-encapsulate-handler-repository-wiring.md)):
 
 ```go
-a.server = server.New(cfg, a.log, a.health, a.metrics, a.buildHandlers(taskRepo)...)
+a.server = server.New(cfg, a.log, a.health, a.metrics, a.buildHandlers())
 ```
 
 The following points are part of the decision, not incidental:
 
-1. **`server.New` is unchanged.** It still accepts `...RouteRegistrar`, because
-   the server's job is mounting routes between its middleware and its
-   `404`/`405` handlers, not assembling modules. The change adds the missing
-   composition step rather than a second server abstraction.
+1. **`server.New` mounts a composed slice.** It takes `[]RouteRegistrar` from
+   `buildHandlers`, because the server's job is mounting routes between its
+   middleware and its `404`/`405` handlers, not assembling modules. Composition
+   stays in `internal/app`; the call site does not spread individual registrars.
 2. **`buildHandlers` owns module construction, not module mechanics.** It calls
    the same constructors `Initialize` used to call and returns the modules as a
    slice literal. There is no registry, no `init()` self-registration, and no
    reflection; the list is readable in one place and checked by the compiler.
-3. **Only shared dependencies are arguments.** `tasks` is the repository port
-   (`service.Repository`) because the task module consumes it; the logger comes
-   from the `App`, which already owns it. Nothing module-specific is passed to
-   the server.
+3. **Shared process dependencies come from `App`.** The pool, list cache, and
+   logger are App fields; `buildHandlers` constructs feature repositories from
+   them. Nothing module-specific is passed to the server.
 4. **Modules keep their existing contract.** A module contributes routes by
    implementing `RegisterRoutes(gin.IRouter)`. Route paths, request decoding,
    response mapping, and error mapping stay in the feature slice; the server
@@ -125,8 +129,9 @@ request handling.
    "wiring changes are visible in one diff" property from ADR 0002.
 4. **A dependency bag passed to `buildHandlers`.** Rejected by ADR 0002: a
    struct of every adapter hides which dependency a module actually uses and
-   makes every module depend on the whole infrastructure surface. The current
-   parameter is the one port the task module needs.
+   makes every module depend on the whole infrastructure surface. Shared
+   resources stay on `App`; feature adapters are constructed inside
+   `buildHandlers` ([ADR 0017](0017-encapsulate-handler-repository-wiring.md)).
 5. **A uniform module lifecycle interface (`Start`/`Stop` per module).**
    Rejected for this change: the process has exactly one HTTP module, one
    background refresher, and one pool, and their ordering is deliberate — the
@@ -157,9 +162,10 @@ request handling.
 
 - **Adding a module:** implement `RegisterRoutes(gin.IRouter)` in the feature's
   handler package, then add its constructor to `buildHandlers` in
-  `internal/app/wiring.go`. If it needs a new shared adapter, construct that
-  adapter in `Initialize` and pass it as a `buildHandlers` parameter or an
-  `App` field — never as a new `server.New` argument.
+  `internal/app/wiring.go`. Construct feature repositories inside
+  `buildHandlers`. If it needs a new process-wide adapter, construct that
+  adapter in `Initialize` and store it on `App` — never as a new `server.New`
+  argument.
 - **Server changes:** `internal/infra/server` must not learn about feature
   packages. A change that requires importing one is a signal that the module's
   HTTP concern belongs in the module.

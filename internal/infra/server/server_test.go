@@ -53,7 +53,7 @@ func newTestServer(t *testing.T, db HealthChecker, modules ...RouteRegistrar) *S
 
 func newTestServerWith(t *testing.T, db HealthChecker, instr Instrumentation, log *slog.Logger, modules ...RouteRegistrar) *Server {
 	t.Helper()
-	return New(Config{Addr: ":0"}, log, db, instr, modules...)
+	return New(Config{Addr: ":0"}, log, db, instr, modules)
 }
 
 func serve(s *Server, method, path string) *httptest.ResponseRecorder {

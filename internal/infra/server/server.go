@@ -63,8 +63,10 @@ type Server struct {
 // New builds the Gin router and wraps it in an *http.Server. db is the
 // database checker /health pings; a nil value makes /health report 503, since a
 // process without persistence is not ready. Tests construct the server that way
-// but the composition root always supplies a pool.
-func New(cfg Config, log *slog.Logger, db HealthChecker, instr Instrumentation, modules ...RouteRegistrar) *Server {
+// but the composition root always supplies a pool. modules is the composed
+// registrar list from the composition root; New mounts them and does not
+// assemble feature modules itself.
+func New(cfg Config, log *slog.Logger, db HealthChecker, instr Instrumentation, modules []RouteRegistrar) *Server {
 	s := &Server{log: log, db: db, instr: instr, modules: modules}
 	s.srv = &http.Server{
 		Addr:              cfg.Addr,

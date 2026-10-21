@@ -7,8 +7,6 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-
-	"github.com/aarashgoodarzi/task-manager/internal/task/repository/postgres"
 )
 
 // TestBuildHandlersComposesTaskAndDocsRoutes verifies the composition point
@@ -18,9 +16,9 @@ import (
 func TestBuildHandlersComposesTaskAndDocsRoutes(t *testing.T) {
 	a := &App{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
-	// Route registration never touches the pool, so a repository with no
-	// database is enough to observe which routes each module contributes.
-	modules := a.buildHandlers(postgres.New(nil))
+	// Route registration never touches the pool, so a nil *sql.DB on the App
+	// is enough to observe which routes each module contributes.
+	modules := a.buildHandlers()
 	if len(modules) == 0 {
 		t.Fatal("buildHandlers returned no modules")
 	}

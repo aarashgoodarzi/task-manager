@@ -20,12 +20,13 @@ file and the older record is marked `Superseded by NNNN`.
 | [0008](0008-containers-and-coverage-gate.md) | Containerized local environment and a 70% coverage gate on the combined suite | Accepted | `Dockerfile`, `.dockerignore`, `compose.yaml`, `Makefile`, CI, README |
 | [0009](0009-openapi-contract.md) | A checked-in OpenAPI document as the HTTP contract | Accepted | `api/`, `internal/infra/swagger/`, `internal/infra/server/`, `internal/app/` |
 | [0010](0010-prometheus-metrics-and-request-correlation.md) | Prometheus metrics and request correlation for HTTP observability | Accepted | `internal/infra/metrics/`, `internal/infra/server/`, `internal/task/repository/postgres/`, `internal/infra/config/`, `internal/app/` |
-| [0011](0011-http-handler-composition.md) | One composition point for HTTP module handlers | Accepted | `internal/app/`, `internal/infra/server/`, `internal/task/handler/`, `internal/infra/swagger/` |
+| [0011](0011-http-handler-composition.md) | One composition point for HTTP module handlers | Accepted (amended by 0017) | `internal/app/`, `internal/infra/server/`, `internal/task/handler/`, `internal/infra/swagger/` |
 | [0012](0012-consumer-owned-ports-dependency-audit.md) | Consumer-owned ports remain the dependency-inversion boundary | Accepted | Whole repository; audited `internal/task/**`, `internal/infra/**`, `internal/app/`, `cmd/` |
 | [0013](0013-redis-cache-aside-for-task-list.md) | Redis cache-aside for task listing with generation-token invalidation | Accepted | `internal/task/service/`, `internal/task/cache/redis/`, `internal/infra/config/`, `internal/app/`, `compose.yaml`, CI, README |
 | [0014](0014-task-filtering-and-pagination.md) | Task filtering and pagination on a paginated collection envelope | Accepted (page-number pagination superseded by 0016) | `internal/task/**`, migrations, schema verification, `api/openapi.yaml`, README |
 | [0015](0015-load-testing-and-profiling.md) | Load testing `GET /tasks` with a small Go runner and opt-in profiling | Accepted | `cmd/loadtest/`, `internal/infra/config/`, `internal/app/`, README |
 | [0016](0016-cursor-pagination-for-task-list.md) | Cursor (keyset) pagination for GET /tasks | Accepted | `internal/task/**`, `api/openapi.yaml`, `cmd/loadtest/`, README |
+| [0017](0017-encapsulate-handler-repository-wiring.md) | Encapsulate repository construction inside handler composition | Accepted | `internal/app/` |
 
 ## When to write one
 

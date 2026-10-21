@@ -104,10 +104,6 @@ func (a *App) Initialize() error {
 	a.db = db
 	a.health = db
 
-	// The pool is wrapped once and shared by the task module and the metrics
-	// refresher; both consume it through the narrow ports they declare.
-	taskRepo := postgres.New(a.db)
-
 	// Redis is an optional accelerator, never the source of truth. Constructing
 	// the adapter does not dial, so a missing or unreachable server leaves the
 	// cache disabled instead of stopping the API. The startup invalidation
@@ -137,9 +133,11 @@ func (a *App) Initialize() error {
 
 	// Instrumentation owns its own registry, so it can be constructed per App
 	// (including in tests) without touching the global Prometheus registry.
+	// The refresher needs only CountTasks; it uses its own repository adapter
+	// over the shared pool and does not participate in HTTP module wiring.
 	a.metrics = infraMetrics.New()
 	a.taskCount, err = infraMetrics.NewTaskCountRefresher(
-		taskRepo, a.metrics, a.cfg.Metrics.TasksRefreshInterval, a.log,
+		postgres.New(a.db), a.metrics, a.cfg.Metrics.TasksRefreshInterval, a.log,
 	)
 	if err != nil {
 		_ = db.Close()
@@ -158,15 +156,15 @@ func (a *App) Initialize() error {
 		a.profileLn = listener
 	}
 
-	// HTTP modules contribute routes through buildHandlers, so Initialize does
-	// not grow an argument per module when a feature is added.
+	// HTTP modules are composed in buildHandlers, which owns repository and
+	// handler wiring. server.New therefore never receives feature repositories.
 	a.server = server.New(server.Config{
 		Addr:              a.cfg.Server.Addr,
 		ReadHeaderTimeout: a.cfg.Server.ReadHeaderTimeout,
 		ReadTimeout:       a.cfg.Server.ReadTimeout,
 		WriteTimeout:      a.cfg.Server.WriteTimeout,
 		IdleTimeout:       a.cfg.Server.IdleTimeout,
-	}, a.log, a.health, a.metrics, a.buildHandlers(taskRepo)...)
+	}, a.log, a.health, a.metrics, a.buildHandlers())
 
 	a.log.Info("task-manager initialized", slog.String("addr", a.cfg.Server.Addr))
 	return nil
