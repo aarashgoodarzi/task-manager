@@ -86,9 +86,10 @@ writes always commit to PostgreSQL first. Cache entries expire after a finite
 TTL, and a mutation advances a generation token so every variant is
 invalidated at once and a slow reader cannot republish a pre-mutation page.
 The consistency limits are documented in
-[ADR 0013](decisions/0013-redis-cache-aside-for-task-list.md) and the
-filtering/cache-key rules in
-[ADR 0014](decisions/0014-task-filtering-and-pagination.md).
+[ADR 0013](decisions/0013-redis-cache-aside-for-task-list.md); filtering and
+cache-key rules begin in
+[ADR 0014](decisions/0014-task-filtering-and-pagination.md) and cursor
+pagination in [ADR 0016](decisions/0016-cursor-pagination-for-task-list.md).
 Production concerns such as authentication, authorization, rate limiting,
 metrics storage and dashboards, distributed tracing, and horizontal
 coordination are outside the current scope. The metrics endpoint is
@@ -1091,7 +1092,7 @@ Important details:
   not rewrite files or fail. Use `gofmt -w .` to fix them. CI fails when any file
   is listed.
 - `coverage.out` matches `*.out` in `.gitignore`.
-- Measured statement coverage on this tree is **76.6%** with PostgreSQL and
+- Measured statement coverage on this tree is **77.9%** with PostgreSQL and
   Redis, and lower without them. The PostgreSQL and Redis adapters only execute
   in their integration tiers.
 - `make coverage-check` enforces `COVERAGE_MIN` (default `70`) on the combined
@@ -1113,33 +1114,40 @@ Important details:
 - The PostgreSQL suite includes `CountTasks` against a real table, including a
   row inserted outside the repository, so the gauge's source of truth is
   exercised rather than mocked.
+- `internal/task/domain` tests cover `ParseStatusFilter` directly (accepted
+  statuses, empty-as-any, and invalid values), separately from `ParseStatus`.
 - `internal/task/service` tests prove cache hits skip the repository, empty
   pages are hits, misses populate the cache, read/write failures fall back, and
   only successful create/update/delete operations invalidate. They also prove
   invalidation survives a canceled request context, that filters are applied
-  before pagination, that offsets and totals are computed correctly, and that
-  the cache receives the normalized query.
+  before keyset pagination, that cursors encode/decode and reject incompatible
+  queries, and that the cache receives the normalized query (including cursor).
 - `internal/task/handler` tests cover every query-parameter failure (unknown
-  status, empty or oversized assignee, zero/negative/malformed/overflowing
-  page, page size above the maximum, unknown parameters), both filters alone
-  and combined, deterministic non-overlapping pages, beyond-the-last pages,
-  default and custom page sizes, and the exact envelope metadata.
+  status, empty or oversized assignee, malformed or incompatible cursor, page
+  size above the maximum, obsolete `page`, unknown parameters), both filters
+  alone and combined, deterministic non-overlapping cursor pages, end-of-list
+  via `has_more`/`next_cursor`, default and custom page sizes, and the cursor
+  envelope metadata.
 - `internal/task/cache/redis` unit tests cover generation initialization, key
-  layout and TTL, empty and malformed payloads, degraded reads after a failed
-  invalidation, the rate-limited recovery probe (success and continued
-  failure), and the stale-refill ordering. They also prove that every distinct
-  query produces a distinct variant key, that equivalent queries share one key,
-  and that two variants cannot answer each other. Integration tests repeat the
-  command-level behavior against a real Redis server, including expiration,
-  variant isolation, whole-family invalidation, and concurrent first reads.
+  layout and TTL, empty and malformed payloads, wrong-version payloads,
+  compare-and-delete recovery that does not remove a concurrent refill,
+  degraded reads after a failed invalidation, the rate-limited recovery probe
+  (success and continued failure), and the stale-refill ordering. They also
+  prove that every distinct query (including distinct cursors) produces a
+  distinct variant key, that equivalent queries share one key, and that two
+  variants cannot answer each other. Integration tests repeat the command-level
+  behavior against a real Redis server, including expiration, variant
+  isolation, whole-family invalidation, and concurrent first reads.
 - `cmd/loadtest` tests cover nearest-rank percentiles, failure accounting,
-  request timeouts, exit-status mapping, option validation, dataset
-  seeding/cleanup bookkeeping, and base-URL handling. The live scenario and the
-  numbers in this README are produced manually against a running service.
+  request timeouts, exit-status mapping (including usage vs evidence
+  categories), option validation (including invalid base URLs), warmup abort
+  behavior, miss-mode generation replacement, dataset seeding/cleanup
+  bookkeeping, and base-URL handling. The live scenario and the numbers in this
+  README are produced manually against a running service.
 - The PostgreSQL suite covers filtering by status and assignee (alone and
-  combined), total counts that use the same filter as the page, deterministic
-  non-overlapping pages, beyond-the-last pages, SQL parameter binding for filter
-  values, and the assignee column constraints.
+  combined), deterministic non-overlapping keyset pages, insert/delete between
+  pages (including the offset-shift contrast), filter-leaving updates, SQL
+  parameter binding for filter values, and the assignee column constraints.
 - `internal/app` tests cover a missing `DATABASE_URL`, a malformed DSN, an
   unreachable server, a missing schema, and successful PostgreSQL wiring with
   caching disabled when `REDIS_URL` is empty.
@@ -1224,8 +1232,10 @@ p95, p99, and maximum latency. Latency samples are per-request observed
 durations of successful requests only; failures are counted and excluded so a
 fast rejection cannot flatter the percentiles. The first three failure messages
 (status code or transport error) are printed; response bodies are never read
-into the report. The process exits `0` only when every request succeeded, `1`
-when requests failed or cleanup did not finish, and `2` for invalid options.
+into the report. The process exits `0` only when every request succeeded; `1`
+when measured requests failed, warmup failed, cleanup did not finish, or a
+required Redis evidence check was missing or contradicted the mode; and `2` for
+unusable options (including a base URL that contains a path).
 
 **Measured results**
 

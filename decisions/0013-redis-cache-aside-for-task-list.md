@@ -70,7 +70,7 @@ disables the feature without changing use-case behavior.
 | Key | Contents | TTL |
 | --- | --- | --- |
 | `task-manager:tasks:list:generation` | Current generation token (hex) | None |
-| `task-manager:tasks:list:<token>:<variant>` | JSON page envelope (schema version 2) | `REDIS_CACHE_TTL`, default `60s` |
+| `task-manager:tasks:list:<token>:<variant>` | JSON page envelope (schema version 3) | `REDIS_CACHE_TTL`, default `60s` |
 
 `<variant>` is an 8-byte hex fingerprint of the normalized query
 (`status`, `assignee`, `cursor`, `page_size`; see

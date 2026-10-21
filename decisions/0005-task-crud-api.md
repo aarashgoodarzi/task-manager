@@ -85,20 +85,21 @@ context while preserving them for `errors.Is`. It imports neither Gin nor
 
 `internal/task/handler` registers five routes on `gin.IRouter`. The paths below
 are the **current** contract (create is not under the collection path; list is
-paginated — see [ADR 0014](0014-task-filtering-and-pagination.md)):
+cursor-paginated — see [ADR 0016](0016-cursor-pagination-for-task-list.md);
+filtering remains as in [ADR 0014](0014-task-filtering-and-pagination.md)):
 
 | Method | Path | Success |
 | --- | --- | --- |
 | `POST` | `/task` | `201` with the created task and a `Location: /tasks/{id}` header |
-| `GET` | `/tasks` | `200` with a page envelope (`items`, `page`, `page_size`, `total`, `total_pages`); `items` is `[]` when empty |
+| `GET` | `/tasks` | `200` with a cursor envelope (`items`, `next_cursor`, `has_more`, `page_size`); `items` is `[]` when empty |
 | `GET` | `/tasks/:id` | `200` with the task |
 | `PUT` | `/tasks/:id` | `200` with the replaced task |
 | `DELETE` | `/tasks/:id` | `204` with no body |
 
 `POST /tasks` is not registered; an unsupported method on `/tasks` returns
-`405 method_not_allowed`. Filtering (`status`, `assignee`) and pagination
-(`page`, `page_size`) are defined in ADR 0014; this record retains the
-resource-level CRUD rules.
+`405 method_not_allowed`. Filtering (`status`, `assignee`) is defined in
+ADR 0014; cursor pagination (`cursor`, `page_size`) is defined in ADR 0016.
+This record retains the resource-level CRUD rules.
 
 Request bodies are decoded strictly: unknown fields, trailing content, wrong
 types, and empty bodies are `400 invalid_request`. Validation failures are
@@ -134,8 +135,8 @@ creation. A missing ID is never upserted.
 
 List order is defined by the adapter: ascending `id`. The order is stable
 across calls but is not creation order; clients must not treat it as such.
-When the result is paginated, `total` / `total_pages` describe the filtered
-set before pagination (ADR 0014).
+When the result is paginated, clients follow `next_cursor` until `has_more` is
+false (ADR 0016); there is no `total` / `total_pages` in the current contract.
 
 ### PostgreSQL adapter
 

@@ -10,6 +10,10 @@
 
 ## Context
 
+**Cursor-based pagination was not necessary to implement for this project;
+page-number pagination is the better fit here. It is implemented mainly to
+show off. :)**
+
 ADR 0014 introduced `page` / `page_size` offset pagination with `total` and
 `total_pages`. Offset pagination is simple, but concurrent inserts or deletes
 between requests shift later pages: a client walking with `OFFSET` can skip or

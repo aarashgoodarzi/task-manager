@@ -75,12 +75,13 @@ traffic would. Each run:
    ([ADR 0016](0016-cursor-pagination-for-task-list.md));
 2. creates `N` tasks with a run-unique title prefix (`loadtest-<unix-nano>-`) and
    assignee `loadtest`;
-3. re-reads `total` and aborts unless it is `baseline + N`;
+3. re-counts by walking cursors again and aborts unless the count is
+   `baseline + N`;
 4. deletes exactly the IDs it created after measuring (accepting `404`).
 
 Existing rows are never modified or deleted, repeat runs do not accumulate
 rows, and an interrupted run leaves identifiable rows that the next run's
-`total` output exposes. Mutations are refused on non-loopback hosts unless the
+count output exposes. Mutations are refused on non-loopback hosts unless the
 operator passes `-allow-remote-mutations`.
 
 ### Cache-warm and cache-miss as distinct, verified scenarios
