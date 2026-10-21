@@ -46,6 +46,64 @@ func TestParseStatus(t *testing.T) {
 	}
 }
 
+func TestParseStatusFilter(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		want      Status
+		wantField string
+	}{
+		{name: "empty means any status", raw: "", want: ""},
+		{name: "whitespace means any status", raw: "   ", want: ""},
+		{name: "todo", raw: "todo", want: StatusTodo},
+		{name: "in progress", raw: "in_progress", want: StatusInProgress},
+		{name: "done", raw: "done", want: StatusDone},
+		{name: "surrounding whitespace is tolerated", raw: " done ", want: StatusDone},
+		{name: "unknown value", raw: "pending", wantField: "status"},
+		{name: "values are case sensitive", raw: "TODO", wantField: "status"},
+		{name: "hyphenated in-progress is rejected", raw: "in-progress", wantField: "status"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseStatusFilter(tc.raw)
+			if tc.wantField != "" {
+				var verr *ValidationError
+				if !errors.As(err, &verr) {
+					t.Fatalf("ParseStatusFilter(%q) error = %v, want *ValidationError", tc.raw, err)
+				}
+				if verr.Field != tc.wantField {
+					t.Fatalf("error field = %q, want %q", verr.Field, tc.wantField)
+				}
+				if got != "" {
+					t.Fatalf("ParseStatusFilter(%q) = %q on error, want empty", tc.raw, got)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ParseStatusFilter(%q) unexpected error: %v", tc.raw, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ParseStatusFilter(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseStatusFilterEmptyDiffersFromParseStatus(t *testing.T) {
+	// Empty filter must not collapse to the write default (todo); that would
+	// silently narrow an unfiltered list.
+	filter, err := ParseStatusFilter("")
+	if err != nil || filter != "" {
+		t.Fatalf("ParseStatusFilter(\"\") = %q, %v; want empty status", filter, err)
+	}
+	writeDefault, err := ParseStatus("")
+	if err != nil || writeDefault != StatusTodo {
+		t.Fatalf("ParseStatus(\"\") = %q, %v; want todo", writeDefault, err)
+	}
+}
+
 func TestStatusValid(t *testing.T) {
 	for _, status := range []Status{StatusTodo, StatusInProgress, StatusDone} {
 		if !status.Valid() {
